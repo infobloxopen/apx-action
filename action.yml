@@ -1,0 +1,105 @@
+name: 'Setup APX'
+description: 'Install the apx CLI and optionally its toolchain dependencies (buf, spectral, oasdiff, protoc-gen-go)'
+author: 'Infoblox'
+
+branding:
+  icon: 'package'
+  color: 'blue'
+
+inputs:
+  version:
+    description: 'APX version to install (e.g. "0.1.0"). Defaults to latest release.'
+    required: false
+    default: 'latest'
+  install-toolchain:
+    description: 'Install the full validator toolchain (buf, spectral, oasdiff, protoc-gen-go, protoc-gen-go-grpc)'
+    required: false
+    default: 'true'
+  buf-version:
+    description: 'buf version to install (default: v1.45.0)'
+    required: false
+    default: 'v1.45.0'
+  spectral-version:
+    description: 'spectral version to install (default: 6.15.0)'
+    required: false
+    default: '6.15.0'
+  oasdiff-version:
+    description: 'oasdiff version to install (default: latest)'
+    required: false
+    default: 'latest'
+  token:
+    description: 'GitHub token for downloading releases (avoids rate limits)'
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  version:
+    description: 'The installed apx version'
+    value: ${{ steps.install-apx.outputs.version }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install apx
+      id: install-apx
+      shell: bash
+      run: |
+        if [[ "${{ inputs.version }}" == "latest" ]]; then
+          curl -fsSL https://raw.githubusercontent.com/infobloxopen/apx/main/install.sh | bash
+        else
+          curl -fsSL https://raw.githubusercontent.com/infobloxopen/apx/main/install.sh \
+            | VERSION=${{ inputs.version }} bash
+        fi
+
+        # Add to PATH
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        export PATH="$HOME/.local/bin:$PATH"
+
+        # Output installed version
+        APX_VERSION=$("$HOME/.local/bin/apx" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[^ ]*' || echo "${{ inputs.version }}")
+        echo "version=$APX_VERSION" >> "$GITHUB_OUTPUT"
+        echo "apx $APX_VERSION installed to $HOME/.local/bin/apx"
+      env:
+        GITHUB_TOKEN: ${{ inputs.token }}
+
+    - name: Install buf
+      if: inputs.install-toolchain == 'true'
+      shell: bash
+      run: |
+        BUF_VERSION="${{ inputs.buf-version }}"
+        BUF_VERSION="${BUF_VERSION#v}"
+        case "${{ runner.os }}" in
+          Linux)  BUF_BINARY="buf-Linux-x86_64" ;;
+          macOS)  BUF_BINARY="buf-Darwin-$(uname -m)" ;;
+          *)      echo "::warning::buf install not supported on ${{ runner.os }}, skipping"; exit 0 ;;
+        esac
+        curl -fsSL "https://github.com/bufbuild/buf/releases/download/v${BUF_VERSION}/${BUF_BINARY}" \
+          -o "$HOME/.local/bin/buf"
+        chmod +x "$HOME/.local/bin/buf"
+        echo "buf v${BUF_VERSION} installed"
+
+    - name: Install spectral
+      if: inputs.install-toolchain == 'true'
+      shell: bash
+      run: |
+        npm install -g @stoplight/spectral-cli@${{ inputs.spectral-version }}
+        echo "spectral ${{ inputs.spectral-version }} installed"
+
+    - name: Install oasdiff
+      if: inputs.install-toolchain == 'true'
+      shell: bash
+      run: |
+        if [[ "${{ inputs.oasdiff-version }}" == "latest" ]]; then
+          go install github.com/oasdiff/oasdiff@latest
+        else
+          go install github.com/oasdiff/oasdiff@${{ inputs.oasdiff-version }}
+        fi
+        echo "oasdiff installed"
+
+    - name: Install protoc-gen-go
+      if: inputs.install-toolchain == 'true'
+      shell: bash
+      run: |
+        go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+        go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+        echo "protoc-gen-go + protoc-gen-go-grpc installed"

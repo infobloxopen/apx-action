@@ -1,0 +1,135 @@
+# Reusable "publish API on change" workflow (Jira ARCH-271).
+#
+# A service repo consumes this from two tiny caller workflows (see
+# docs/apx-publish.md): one on pull_request (mode: check — report drift, breaking,
+# and path-reconciliation without blocking), one on push to the default branch
+# (mode: publish — open a PR into the catalog + a drift issue when the API changed).
+#
+# The per-repo adoption surface is a single .apx-publish.yaml in the service repo.
+# Bumping the ref this workflow is pinned at (or its default apx version) updates
+# every consuming repo at once — no per-repo edit.
+name: apx publish-on-change
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: 'check (PR CI, report-only) or publish (on-merge, open PR + issue)'
+        required: true
+        type: string
+      config:
+        description: 'Per-repo config file'
+        required: false
+        type: string
+        default: '.apx-publish.yaml'
+      apx-version:
+        description: 'apx version to install (must be drift-capable, >= the ARCH-271 release)'
+        required: false
+        type: string
+        default: 'latest'
+      apx-action-ref:
+        description: 'Ref of infobloxopen/apx-action to load the publish script from (pin to the same ref you call this workflow at)'
+        required: false
+        type: string
+        default: 'v1'
+      go-version-file:
+        description: 'go.mod used to pin the Go toolchain'
+        required: false
+        type: string
+        default: 'go.mod'
+      breaking-gate:
+        description: 'auto | advisory | blocking (auto = public blocks, internal advisory)'
+        required: false
+        type: string
+        default: 'auto'
+      auto-merge:
+        description: '(gitea sandbox only) merge the publish PR + finalize to demo the catalog updating'
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      canonical-token:
+        description: 'Token with PR + issue write on the canonical GitHub repo (forge: github)'
+        required: false
+      gitea-url:
+        required: false
+      gitea-org:
+        required: false
+      gitea-user:
+        required: false
+      gitea-password:
+        required: false
+      gitea-token:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  apx-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout service repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ inputs.go-version-file }}
+
+      - name: Set up apx + toolchain
+        uses: infobloxopen/apx-action@v1
+        with:
+          version: ${{ inputs.apx-version }}
+
+      - name: Load the publish script
+        uses: actions/checkout@v4
+        with:
+          repository: infobloxopen/apx-action
+          ref: ${{ inputs.apx-action-ref }}
+          path: _apx_action
+
+      - name: Read canonical repo from config
+        id: cfg
+        env:
+          APX_CONFIG: ${{ inputs.config }}
+        run: |
+          set -euo pipefail
+          echo "canonical_repo=$(yq -r '.canonical_repo' "$APX_CONFIG")" >> "$GITHUB_OUTPUT"
+          echo "forge=$(yq -r '.forge // "github"' "$APX_CONFIG")" >> "$GITHUB_OUTPUT"
+
+      - name: Clone canonical catalog
+        env:
+          GH_TOKEN: ${{ secrets.canonical-token }}
+          GITEA_TOKEN: ${{ secrets.gitea-token }}
+          CANONICAL_REPO: ${{ steps.cfg.outputs.canonical_repo }}
+          FORGE: ${{ steps.cfg.outputs.forge }}
+        run: |
+          set -euo pipefail
+          # host/path only — the credential goes in a header, never in the URL argv.
+          host_path="${CANONICAL_REPO#http*://}"; host_path="${host_path%.git}"
+          if [[ "$FORGE" == "gitea" ]]; then
+            git -c "http.extraHeader=Authorization: token ${GITEA_TOKEN}" \
+              clone --quiet "http://${host_path}.git" .canonical
+          else
+            git clone --quiet "https://x-access-token:${GH_TOKEN}@github.com/${host_path#github.com/}.git" .canonical
+          fi
+
+      - name: Run apx publish-on-change
+        env:
+          GITHUB_TOKEN: ${{ secrets.canonical-token }}
+          GITEA_URL: ${{ secrets.gitea-url }}
+          GITEA_ORG: ${{ secrets.gitea-org }}
+          GITEA_TOKEN: ${{ secrets.gitea-token }}
+          APX_MODE: ${{ inputs.mode }}
+          APX_CONFIG: ${{ inputs.config }}
+          APX_BREAKING_GATE: ${{ inputs.breaking-gate }}
+          APX_AUTO_MERGE: ${{ inputs.auto-merge }}
+        run: |
+          set -euo pipefail
+          chmod +x _apx_action/scripts/apx-publish.sh
+          args=(--mode "$APX_MODE" --config "$APX_CONFIG" --canonical-dir .canonical --breaking-gate "$APX_BREAKING_GATE")
+          [[ "$APX_AUTO_MERGE" == "true" ]] && args+=(--auto-merge)
+          _apx_action/scripts/apx-publish.sh "${args[@]}"

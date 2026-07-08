@@ -221,6 +221,11 @@ jobs:
             git config --global "http.https://github.com/.extraheader" \
               "AUTHORIZATION: Basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
           fi
+          # apx release submit commits the staged snapshot inside its temp clone; CI
+          # runners have no default git identity, so set the submit-App bot identity
+          # (otherwise submit fails with "empty ident name not allowed").
+          git config --global user.name "apx-submit[bot]"
+          git config --global user.email "apx-submit[bot]@users.noreply.github.com"
           chmod +x _apx_action/scripts/apx-publish.sh
           args=(--mode "$APX_MODE" --config "$APX_CONFIG" --canonical-dir .canonical --breaking-gate "$APX_BREAKING_GATE")
           [[ "$APX_AUTO_MERGE" == "true" ]] && args+=(--auto-merge)

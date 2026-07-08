@@ -211,6 +211,16 @@ jobs:
           APX_AUTO_MERGE: ${{ inputs.auto-merge }}
         run: |
           set -euo pipefail
+          # `apx release submit` (publish mode) clones + pushes the canonical repo over
+          # https with a plain `git clone` (no token injection). Configure the submit-App
+          # token as a git credential for github.com so that private clone/push
+          # authenticates — otherwise it fails with "could not read Username for
+          # 'https://github.com'". The token is canonical-repo-scoped, so it is harmless
+          # for any other host/repo git may touch.
+          if [ -n "${GITHUB_TOKEN:-}" ]; then
+            git config --global "http.https://github.com/.extraheader" \
+              "AUTHORIZATION: Basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
+          fi
           chmod +x _apx_action/scripts/apx-publish.sh
           args=(--mode "$APX_MODE" --config "$APX_CONFIG" --canonical-dir .canonical --breaking-gate "$APX_BREAKING_GATE")
           [[ "$APX_AUTO_MERGE" == "true" ]] && args+=(--auto-merge)

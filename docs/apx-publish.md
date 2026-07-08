@@ -37,13 +37,27 @@ FDS step runs the repo's **own** `docker run ...atlas-gentool` and needs the hos
 Docker daemon, so the tools ride *alongside* it rather than replacing the host.
 
 **The FDS is cached, not committed.** The FileDescriptorSet the converter reads is a
-pure function of the repo's committed protos + its pinned gentool, so the workflow
-caches it (`actions/cache`, keyed on `hashFiles('**/*.proto', '**/Makefile*')`)
-instead of asking each repo to commit a `.binpb`. On a cache hit the publish script
-skips `make <fds_target>` entirely — the atlas-gentool `docker run` (the slow step)
-runs only when a proto or the Makefile gentool pin actually changed, which flips the
-key. Correct by construction (a proto change can never publish a stale FDS) and
-self-healing (nothing to re-commit).
+pure function of two input sets, and the workflow caches it (`actions/cache`)
+instead of asking each repo to commit a `.binpb`:
+
+1. **The protos in the compile closure** — the service protos plus every import that
+   resolves from the repo (its committed `proto/third-party`).
+2. **The gentool image + the recipe** — protos bundled *inside* the image (the
+   `google/*` well-known types, `google/api`, …) are versioned by the image pin, and
+   the `-I` includes + `--include_imports` flag live in the makefiles alongside it.
+
+The cache key is a content hash over both: every `**/*.proto` and every `**/Makefile*`
+(overridable per repo via `fds_key_files:`). Any change to a proto, an include, or the
+gentool pin flips the key, so on a cache hit the publish script skips `make <fds_target>`
+entirely — the atlas-gentool `docker run` (the slow step) runs only when an FDS input
+actually changed. Correct by construction (a proto change can never publish a stale FDS)
+and self-healing (nothing to re-commit). Over-breadth is safe: an unrelated match only
+forces a needless regen, never a stale hit.
+
+> **Pin the gentool by digest.** The key hashes the pin *string*, so a floating or
+> re-pushable tag could let a re-pushed image serve a stale cached FDS. Pin the image
+> by `@sha256:…` (keep the human tag for readability: `atlas-gentool:v21.8.17@sha256:…`).
+> This closes the gap *and* makes the un-cached `make fds` reproducible.
 
 **Latest-vs-fast:** the moving `:v1` / `:latest` tags are rebuilt whenever apx or the
 converter cut a release, so floating-tag consumers get the newest set as a fast image
@@ -75,6 +89,11 @@ apx pathlint --ingress <rendered> --spec <specs> --warn-only   # path reconcilia
    	$(GENERATOR) $(FDS_INCLUDES) --include_imports \
    		--descriptor_set_out=$(PROJECT_ROOT)/api-v1.binpb $(PROJECT_ROOT)/pkg/v1/pb/identity.proto
    ```
+   Pin the gentool image **by digest** (`ghcr.io/…/atlas-gentool:v21.8.17@sha256:…`),
+   not a bare tag — the FDS cache trusts the pin, and a digest makes it immutable.
+   If your gentool pin does **not** live in a `Makefile*` (e.g. it's in a `.env` or a
+   script), list the file(s) that carry it under `fds_key_files:` (below) so the cache
+   key sees a gentool bump.
 2. **`apx.yaml`** — standard apx project config. `module_roots` must include where
    the workflow stages converted specs (`build/apx-modules`).
 3. **`.apx-publish.yaml`** — the entire per-repo adoption surface:
@@ -84,6 +103,10 @@ apx pathlint --ingress <rendered> --spec <specs> --warn-only   # path reconcilia
    fds_target: fds
    converter_version: v0.60.0
    version_bump: minor
+   # fds_key_files:                # optional — files that determine the FDS bytes.
+   #   - '**/*.proto'              # default: all protos + every Makefile* (the
+   #   - '**/Makefile*'            # gentool pin + includes). Override only if your
+   #   - 'build/gentool.version'   # gentool pin lives outside a Makefile*.
    modules:
      - id: openapi/csp.infoblox.com/identity/v2    # R10 module ID
        swagger: pkg/v2/pb/identity.swagger.json    # committed gateway swagger

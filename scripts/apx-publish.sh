@@ -98,8 +98,21 @@ if ! command -v openapiv2to3 >/dev/null; then
 fi
 
 # ── FileDescriptorSet(s) via the repo's own gentool ───────────────────────────
-log "make $FDS_TARGET (FileDescriptorSet)"
-make "$FDS_TARGET"
+# The FDS is a pure function of the committed protos + the pinned gentool, so it
+# is treated as a cached CI artifact (the caller keys a cache on the proto/Makefile
+# hash), never committed to git. The repo's atlas-gentool `docker run` — the slow
+# step — runs only when the cache did not restore every FDS the modules reference,
+# i.e. only when a proto actually changed. On a cache hit this is skipped entirely.
+fds_missing=0
+for ((i=0; i<NMODULES; i++)); do
+  [[ -f "$(yq -r ".modules[$i].fds" "$CONFIG")" ]] || { fds_missing=1; break; }
+done
+if [[ "$fds_missing" -eq 1 ]]; then
+  log "make $FDS_TARGET (FileDescriptorSet — cache miss / proto changed)"
+  make "$FDS_TARGET"
+else
+  log "FileDescriptorSet(s) present (restored from cache) — skipping 'make $FDS_TARGET'"
+fi
 
 # module name = the <name> segment of format/domain/name/line
 module_name() { echo "$1" | awk -F/ '{print $(NF-1)}'; }

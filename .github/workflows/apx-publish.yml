@@ -103,6 +103,54 @@ jobs:
             printf '  %-20s %s\n' "$t" "$v"
           done
 
+      # The FileDescriptorSet the converter needs is a pure function of the repo's
+      # committed protos + its pinned gentool. Cache it (never commit it) so the
+      # slow step — the repo's own atlas-gentool `docker run`, invoked by
+      # `make <fds_target>` in the publish script — runs only on a real proto change.
+      - name: Resolve FileDescriptorSet cache inputs
+        id: fds
+        env:
+          APX_CONFIG: ${{ inputs.config }}
+        run: |
+          set -euo pipefail
+          # Paths the modules reference (repo-relative; may be scattered), emitted
+          # as a multiline output for actions/cache to restore + save.
+          {
+            echo 'paths<<EOF'
+            yq -r '.modules[].fds' "$APX_CONFIG" | sort -u
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+
+          # Cache key = a content hash of EVERY file that determines the FDS bytes:
+          #   1. all protos in the compile closure (repo-local imports included);
+          #   2. the makefiles that pin the gentool image + the -I includes + flags.
+          # Protos bundled INSIDE the gentool image (google/*, etc.) are versioned
+          # by that pin, so hashing the makefile that carries it captures them too —
+          # pin the image by @sha256 (not a floating tag) to make the pin immutable.
+          # A repo whose gentool pin lives outside a Makefile* overrides the globs
+          # via `fds_key_files:` in its config; the default covers make-driven repos.
+          # Over-breadth is safe: an unrelated match only forces a needless regen
+          # (a miss), never a stale hit.
+          mapfile -t globs < <(yq -r '.fds_key_files[]?' "$APX_CONFIG")
+          [[ ${#globs[@]} -gt 0 ]] || globs=('**/*.proto' '**/Makefile*')
+          specs=(); for g in "${globs[@]}"; do specs+=(":(glob)$g"); done
+          n=$(git ls-files -- "${specs[@]}" | wc -l)
+          [[ "$n" -gt 0 ]] || { echo "no FDS key files matched: ${globs[*]}" >&2; exit 1; }
+          key_hash=$(git ls-files -z -- "${specs[@]}" | sort -z \
+            | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)
+          echo "FDS cache key covers $n file(s) via ${#globs[@]} glob(s): ${globs[*]}"
+          git ls-files -- "${specs[@]}" | sed 's/^/  /'
+          echo "key_hash=$key_hash" >> "$GITHUB_OUTPUT"
+
+      - name: Cache FileDescriptorSet(s)
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.fds.outputs.paths }}
+          # Flips when any FDS input changes → regenerated exactly when it must be,
+          # never stale. On a hit the publish script skips `make <fds_target>`
+          # (no gentool, no Docker run).
+          key: apx-fds-${{ runner.os }}-${{ steps.fds.outputs.key_hash }}
+
       - name: Load the publish script
         uses: actions/checkout@v5
         with:

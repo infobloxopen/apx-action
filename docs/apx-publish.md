@@ -78,7 +78,9 @@ jobs:
   check:
     uses: infobloxopen/apx-action/.github/workflows/apx-publish.yml@v1
     with: { mode: check, apx-action-ref: v1 }
-    secrets: { ... }        # canonical-token (github) or gitea-* (sandbox)
+    secrets:
+      apx-app-id:          ${{ secrets.APX_SUBMIT_APP_ID }}
+      apx-app-private-key: ${{ secrets.APX_SUBMIT_APP_PRIVATE_KEY }}
 ```
 
 ```yaml
@@ -87,8 +89,25 @@ jobs:
   publish:
     uses: infobloxopen/apx-action/.github/workflows/apx-publish.yml@v1
     with: { mode: publish, apx-action-ref: v1 }
-    secrets: { ... }
+    secrets:
+      apx-app-id:          ${{ secrets.APX_SUBMIT_APP_ID }}
+      apx-app-private-key: ${{ secrets.APX_SUBMIT_APP_PRIVATE_KEY }}
 ```
+
+### Credentials (least privilege, no per-repo secrets)
+
+The workflow mints a **short-lived installation token** from a dedicated
+least-privilege **catalog "submit" GitHub App** via `create-github-app-token`,
+scoped to the catalog repo. The App needs only `contents:write` +
+`pull_requests:write` + `issues:write` on the catalog — **no tag-ruleset bypass
+and no admin** — so it can push an `apx/release/*` branch and open a PR + drift
+issue, but cannot push tags, merge, or bypass branch protection (merges still
+require the catalog's `CODEOWNERS` review). Its `APX_SUBMIT_APP_ID` /
+`APX_SUBMIT_APP_PRIVATE_KEY` live as **organization secrets in the consuming
+repos' org** (not this repo — a reusable workflow resolves secrets from the
+caller's context), so the ~40 adopting repos manage nothing beyond `secrets:`
+passing. This is deliberately a *different, narrower* App than the canonical
+repo's high-privilege release/finalize App.
 
 ## R10 module IDs
 

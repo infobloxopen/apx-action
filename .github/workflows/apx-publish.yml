@@ -48,8 +48,13 @@ on:
         type: boolean
         default: false
     secrets:
-      canonical-token:
-        description: 'Token with PR + issue write on the canonical GitHub repo (forge: github)'
+      # Least-privilege catalog "submit" GitHub App (forge: github). App needs
+      # only contents:write + pull_requests:write + issues:write on the catalog
+      # repo — NO tag-ruleset bypass, NO admin. Provide as org secrets in the
+      # consuming repos' org so the workflow mints a short-lived scoped token.
+      apx-app-id:
+        required: false
+      apx-app-private-key:
         required: false
       gitea-url:
         required: false
@@ -97,12 +102,27 @@ jobs:
           APX_CONFIG: ${{ inputs.config }}
         run: |
           set -euo pipefail
-          echo "canonical_repo=$(yq -r '.canonical_repo' "$APX_CONFIG")" >> "$GITHUB_OUTPUT"
+          repo="$(yq -r '.canonical_repo' "$APX_CONFIG")"
+          echo "canonical_repo=$repo" >> "$GITHUB_OUTPUT"
           echo "forge=$(yq -r '.forge // "github"' "$APX_CONFIG")" >> "$GITHUB_OUTPUT"
+          # Derive owner/name for the App-token installation scope (github forge).
+          hp="${repo#http*://}"; hp="${hp%.git}"; hp="${hp#github.com/}"
+          echo "canonical_owner=${hp%%/*}" >> "$GITHUB_OUTPUT"
+          echo "canonical_name=${hp##*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Mint catalog submit-App token
+        id: catalog-token
+        if: steps.cfg.outputs.forge == 'github'
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.apx-app-id }}
+          private-key: ${{ secrets.apx-app-private-key }}
+          owner: ${{ steps.cfg.outputs.canonical_owner }}
+          repositories: ${{ steps.cfg.outputs.canonical_name }}
 
       - name: Clone canonical catalog
         env:
-          GH_TOKEN: ${{ secrets.canonical-token }}
+          GH_TOKEN: ${{ steps.catalog-token.outputs.token }}
           GITEA_TOKEN: ${{ secrets.gitea-token }}
           CANONICAL_REPO: ${{ steps.cfg.outputs.canonical_repo }}
           FORGE: ${{ steps.cfg.outputs.forge }}
@@ -119,7 +139,7 @@ jobs:
 
       - name: Run apx publish-on-change
         env:
-          GITHUB_TOKEN: ${{ secrets.canonical-token }}
+          GITHUB_TOKEN: ${{ steps.catalog-token.outputs.token }}
           GITEA_URL: ${{ secrets.gitea-url }}
           GITEA_ORG: ${{ secrets.gitea-org }}
           GITEA_TOKEN: ${{ secrets.gitea-token }}

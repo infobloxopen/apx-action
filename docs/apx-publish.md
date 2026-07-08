@@ -36,6 +36,15 @@ The job stays on `ubuntu-latest` (rather than a `container:` job) on purpose: th
 FDS step runs the repo's **own** `docker run ...atlas-gentool` and needs the host
 Docker daemon, so the tools ride *alongside* it rather than replacing the host.
 
+**The FDS is cached, not committed.** The FileDescriptorSet the converter reads is a
+pure function of the repo's committed protos + its pinned gentool, so the workflow
+caches it (`actions/cache`, keyed on `hashFiles('**/*.proto', '**/Makefile*')`)
+instead of asking each repo to commit a `.binpb`. On a cache hit the publish script
+skips `make <fds_target>` entirely — the atlas-gentool `docker run` (the slow step)
+runs only when a proto or the Makefile gentool pin actually changed, which flips the
+key. Correct by construction (a proto change can never publish a stale FDS) and
+self-healing (nothing to re-commit).
+
 **Latest-vs-fast:** the moving `:v1` / `:latest` tags are rebuilt whenever apx or the
 converter cut a release, so floating-tag consumers get the newest set as a fast image
 *pull*, never a compile; the validators (buf/spectral/oasdiff/protoc-gen-go[-grpc])

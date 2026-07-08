@@ -17,9 +17,29 @@ devedge-sdk; release/breaking/catalog are apx); this workflow only **orchestrate
 
 - Reusable workflow: `.github/workflows/apx-publish.yml` (`on: workflow_call`)
 - Engine (runs identically in CI and locally): `scripts/apx-publish.sh`
+- Prebuilt toolchain: `ghcr.io/infobloxopen/apx-toolchain` (built by
+  `.github/workflows/publish-toolchain-image.yml` from the `Dockerfile`)
 
 Because consumers reference the workflow by ref, a fix here reaches every repo by
 bumping one ref — no per-repo edit.
+
+## Toolchain (prebuilt image)
+
+The workflow pulls its tools from a **prebuilt, pinned image**
+(`ghcr.io/infobloxopen/apx-toolchain:v1`) and lifts the binaries onto `PATH`,
+instead of installing + compiling them on every run (which cost ~2 min:
+`npm install spectral`, `go install oasdiff`/`protoc-gen-go`, `curl` apx/buf).
+It bundles apx, the `openapiv2to3` converter, buf, spectral (standalone binary —
+no node/npm), oasdiff, and protoc-gen-go[-grpc], plus yq + jq.
+
+The job stays on `ubuntu-latest` (rather than a `container:` job) on purpose: the
+FDS step runs the repo's **own** `docker run ...atlas-gentool` and needs the host
+Docker daemon, so the tools ride *alongside* it rather than replacing the host.
+
+**Latest-vs-fast:** the moving `:v1` / `:latest` tags are rebuilt whenever apx or the
+converter cut a release, so floating-tag consumers get the newest set as a fast image
+*pull*, never a compile; the validators (buf/spectral/oasdiff/protoc-gen-go[-grpc])
+stay pinned for reproducibility.
 
 ## Pipeline
 

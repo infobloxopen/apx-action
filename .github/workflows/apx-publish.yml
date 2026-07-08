@@ -23,7 +23,7 @@ on:
         type: string
         default: '.apx-publish.yaml'
       apx-version:
-        description: 'apx version to install (must be drift-capable, >= the ARCH-271 release)'
+        description: 'apx version (advisory). The toolchain is now provisioned from the prebuilt ghcr.io/infobloxopen/apx-toolchain image, whose moving :v1 tag tracks the latest drift-capable apx; pin apx by using an image tag instead.'
         required: false
         type: string
         default: 'latest'
@@ -33,7 +33,7 @@ on:
         type: string
         default: 'v1'
       go-version-file:
-        description: 'go.mod used to pin the Go toolchain'
+        description: 'Retained for compatibility; unused. The toolchain is prebuilt, and the FDS is emitted by the repo''s own (containerized) gentool, so no host Go toolchain is set up.'
         required: false
         type: string
         default: 'go.mod'
@@ -75,22 +75,36 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout service repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: ${{ inputs.go-version-file }}
-
-      - name: Set up apx + toolchain
-        uses: infobloxopen/apx-action@v1
-        with:
-          version: ${{ inputs.apx-version }}
+      # Provision apx + its validator toolchain from the PREBUILT image instead of
+      # installing/compiling it per run (npm install spectral, go install oasdiff/
+      # protoc-gen-go, curl apx/buf). We lift the pinned binaries out of the image
+      # and onto PATH rather than running the job inside `container:` — the FDS step
+      # (`make <fds_target>`) shells out to the repo's own `docker run atlas-gentool`,
+      # which needs the host Docker daemon; a container job would break that host
+      # bind mount. This keeps the interface + behavior identical, just fast.
+      - name: Provision apx toolchain (prebuilt image)
+        env:
+          TOOLCHAIN_IMAGE: ghcr.io/infobloxopen/apx-toolchain:v1
+        run: |
+          set -euo pipefail
+          cid="$(docker create "$TOOLCHAIN_IMAGE")"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          dest="$HOME/.apx-toolchain/bin"
+          mkdir -p "$dest"
+          docker cp "$cid:/usr/local/bin/." "$dest/"
+          echo "$dest" >> "$GITHUB_PATH"
+          echo "Provisioned from $TOOLCHAIN_IMAGE:"
+          for t in apx openapiv2to3 buf spectral oasdiff protoc-gen-go protoc-gen-go-grpc yq jq; do
+            v="$("$dest/$t" --version 2>/dev/null | head -1 || echo present)"
+            printf '  %-20s %s\n' "$t" "$v"
+          done
 
       - name: Load the publish script
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: infobloxopen/apx-action
           ref: ${{ inputs.apx-action-ref }}
@@ -113,7 +127,7 @@ jobs:
       - name: Mint catalog submit-App token
         id: catalog-token
         if: steps.cfg.outputs.forge == 'github'
-        uses: actions/create-github-app-token@v1
+        uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ secrets.apx-app-id }}
           private-key: ${{ secrets.apx-app-private-key }}

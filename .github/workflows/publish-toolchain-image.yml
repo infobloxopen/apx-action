@@ -1,0 +1,106 @@
+# Build + push the prebuilt apx publish-on-change toolchain image to GHCR
+# (ghcr.io/infobloxopen/apx-toolchain). See Dockerfile.
+#
+# Tagging (ARCH-271 latest-vs-fast split):
+#   :<apx-version>  e.g. :v0.19.0  — immutable, records the apx release it bundles
+#   :v1             — moving major; the reusable workflow pulls THIS (always latest set)
+#   :latest         — moving convenience tag
+#
+# Rebuilding the moving tags whenever apx (or the openapiv2to3 converter) cuts a
+# release keeps floating-tag consumers current as a fast image PULL, never a compile.
+#
+# Publishes with the repo's GITHUB_TOKEN (packages: write) — the same GHCR posture
+# the org already uses for the apx catalog images. Multi-arch: linux/amd64 + arm64.
+name: Publish apx-toolchain image
+
+on:
+  workflow_dispatch:
+    inputs:
+      apx-version:
+        description: 'apx release to bundle (a tag like v0.19.0, or "latest")'
+        required: false
+        default: 'latest'
+      platforms:
+        description: 'buildx target platforms'
+        required: false
+        default: 'linux/amd64,linux/arm64'
+  push:
+    branches: [main]
+    paths:
+      - 'Dockerfile'
+      - '.github/workflows/publish-toolchain-image.yml'
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-toolchain-image
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/infobloxopen/apx-toolchain
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Resolve apx version
+        id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED: ${{ github.event.inputs.apx-version || 'latest' }}
+        run: |
+          set -euo pipefail
+          apx="$REQUESTED"
+          if [[ "$apx" == "latest" || -z "$apx" ]]; then
+            apx="$(gh release view --repo infobloxopen/apx --json tagName -q .tagName)"
+          fi
+          [[ "$apx" == v* ]] || apx="v${apx}"
+          echo "apx=$apx" >> "$GITHUB_OUTPUT"
+          echo "Bundling apx $apx"
+
+      - name: Enable arm64 emulation (binfmt)
+        run: docker run --privileged --rm tonistiigi/binfmt --install arm64
+
+      - name: Create buildx builder
+        run: |
+          docker buildx create --name apx-toolchain-builder --driver docker-container --use
+          docker buildx inspect --bootstrap
+
+      - name: Log in to GHCR
+        run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build and push (multi-arch)
+        env:
+          PLATFORMS: ${{ github.event.inputs.platforms || 'linux/amd64,linux/arm64' }}
+          APX: ${{ steps.v.outputs.apx }}
+        run: |
+          set -euo pipefail
+          printf '%s' "${{ github.token }}" > /tmp/gh_build_token
+          docker buildx build \
+            --platform "$PLATFORMS" \
+            --secret id=github_token,src=/tmp/gh_build_token \
+            --build-arg "APX_VERSION=${APX}" \
+            --tag "${IMAGE}:${APX}" \
+            --tag "${IMAGE}:v1" \
+            --tag "${IMAGE}:latest" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --provenance=false \
+            --push .
+          rm -f /tmp/gh_build_token
+
+      - name: Summary
+        env:
+          APX: ${{ steps.v.outputs.apx }}
+        run: |
+          {
+            echo "## Published apx-toolchain image"
+            echo ""
+            echo "- \`${IMAGE}:${APX}\` (immutable)"
+            echo "- \`${IMAGE}:v1\` (moving major — pulled by apx-publish.yml)"
+            echo "- \`${IMAGE}:latest\` (moving)"
+          } >> "$GITHUB_STEP_SUMMARY"

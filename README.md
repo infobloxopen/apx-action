@@ -8,9 +8,9 @@ GitHub Action to install the [apx](https://github.com/infobloxopen/apx) CLI and 
 
 ```yaml
 steps:
-  - uses: actions/checkout@v4
+  - uses: actions/checkout@v5
 
-  - uses: actions/setup-go@v5
+  - uses: actions/setup-go@v6
     with:
       go-version-file: go.mod
 
@@ -80,6 +80,20 @@ When `install-toolchain: true` (default), the action installs:
 
 - **Go** must be set up (e.g. via `actions/setup-go`) if `install-toolchain: true`
 - **Node.js** must be available for spectral (pre-installed on GitHub-hosted runners)
+
+## Prebuilt CI image
+
+This composite action installs the toolchain from scratch, which suits ad-hoc steps.
+For repeated CI (e.g. the `apx-publish.yml` reusable workflow), pull the **prebuilt,
+pinned** image instead — seconds to pull versus ~2 min to install + compile:
+
+```
+ghcr.io/infobloxopen/apx-toolchain:v1   # apx + openapiv2to3 + buf + spectral + oasdiff + protoc-gen-go[-grpc] + yq + jq
+```
+
+It carries a standalone `spectral` binary (no node/npm) and is multi-arch
+(linux/amd64 + arm64). The moving `:v1`/`:latest` tags track the latest apx +
+converter; validators are pinned. Built by `.github/workflows/publish-toolchain-image.yml`.
 
 ## License
 

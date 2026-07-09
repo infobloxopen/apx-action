@@ -85,10 +85,35 @@ NMODULES=$(yq -r '.modules | length' "$CONFIG")
 # github.com-style NWO used by apx for identity/go-module derivation (even on gitea).
 CANON_NWO=$(echo "$CANONICAL_REPO" | sed -E 's#^https?://##; s#\.git$##; s#^[^/]+/##')
 
-log "mode=$MODE forge=$FORGE canonical=$CANONICAL_REPO modules=$NMODULES"
+# ── Branch routing (ARCH-271) ─────────────────────────────────────────────────
+# Resolve the service repo's source branch → the canonical-repo base branch this
+# run publishes to, from `.apx-publish.yaml` `branch_targets` (default:
+# main/master→main, develop→develop; tweakable). A resolved base branch other
+# than "main" is a PRE-RELEASE channel: apx publishes vX.Y.Z-beta.N versions that
+# carry a short commit hash, and its ratchet keeps them above the line's GA.
+default_base() { case "$1" in main|master) echo main;; develop) echo develop;; *) echo main;; esac; }
+SRC_BRANCH="${GITHUB_REF_NAME:-$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)}"
+BASE_BRANCH=$(yq -r ".branch_targets.\"$SRC_BRANCH\" // \"\"" "$CONFIG")
+[[ -n "$BASE_BRANCH" && "$BASE_BRANCH" != "null" ]] || BASE_BRANCH=$(default_base "$SRC_BRANCH")
+PRERELEASE=0; [[ "$BASE_BRANCH" != "main" ]] && PRERELEASE=1
+
+# Compare drift/breaking against — and, on publish, target — the resolved base
+# branch of the canonical clone. Best-effort: fall back to the default branch
+# (with a warning) if the base branch does not exist there yet.
+if [[ -n "$CANONICAL_DIR" && -d "$CANONICAL_DIR/.git" ]]; then
+  if git -C "$CANONICAL_DIR" rev-parse --verify --quiet "origin/$BASE_BRANCH" >/dev/null 2>&1; then
+    git -C "$CANONICAL_DIR" checkout -q -B "$BASE_BRANCH" "origin/$BASE_BRANCH" 2>/dev/null || \
+      git -C "$CANONICAL_DIR" checkout -q "$BASE_BRANCH" 2>/dev/null || true
+  elif [[ "$BASE_BRANCH" != "main" ]]; then
+    log "WARNING: base branch '$BASE_BRANCH' not found in canonical clone — comparing/publishing against its default branch"
+  fi
+fi
+
+log "mode=$MODE forge=$FORGE canonical=$CANONICAL_REPO modules=$NMODULES source=$SRC_BRANCH base=$BASE_BRANCH prerelease=$PRERELEASE"
 note "## apx publish-on-change ($MODE)"
 note ""
 note "Canonical: \`$CANONICAL_REPO\` · forge: \`$FORGE\` · modules: $NMODULES"
+note "Source branch: \`$SRC_BRANCH\` → base branch: \`$BASE_BRANCH\`$([[ "$PRERELEASE" == "1" ]] && echo ' (pre-release / beta channel)')"
 note ""
 
 # ── openapiv2to3 (converter) ──────────────────────────────────────────────────
@@ -118,10 +143,14 @@ fi
 module_name() { echo "$1" | awk -F/ '{print $(NF-1)}'; }
 
 # next_version <published-version-or-empty> <line>
+# Computes the next STABLE version by bumping the published version per
+# VERSION_BUMP. Any pre-release/build suffix on the published version is stripped
+# first so a develop clone's beta tags don't corrupt the arithmetic.
 next_version() {
   local pub="$1" line="$2" major
   major="${line#v}"
   if [[ -z "$pub" ]]; then echo "v${major}.0.0"; return; fi
+  pub="${pub%%-*}"; pub="${pub%%+*}"   # strip -prerelease / +build
   IFS='.' read -r a b c <<<"${pub#v}"
   case "$VERSION_BUMP" in
     major) echo "v$((a+1)).0.0" ;;
@@ -129,6 +158,20 @@ next_version() {
     *)     echo "v${a}.$((b+1)).0" ;;
   esac
 }
+
+# channel_version <published-version-or-empty> <line>
+# The version to publish for the current channel: on the stable channel this is
+# the plain next_version; on a pre-release channel it is that base tagged
+# -beta.1 (apx encodes the commit hash and ratchets it above the line's GA).
+channel_version() {
+  local base; base=$(next_version "$1" "$2")
+  if [[ "$PRERELEASE" == "1" ]]; then echo "${base}-beta.1"; else echo "$base"; fi
+}
+
+# channel_lifecycle <module-declared-lifecycle>
+# The pre-release channel always publishes beta; the stable channel uses the
+# module's declared lifecycle.
+channel_lifecycle() { if [[ "$PRERELEASE" == "1" ]]; then echo beta; else echo "$1"; fi; }
 
 # Staged converted specs, and per-module status, collected for the summary + publish.
 declare -a IDS NAMES LIFECYCLES SPECFILES STATUSES PUBVERS BLOCKED
@@ -219,6 +262,26 @@ if [[ "$MODE" == "check" ]]; then
     log "check FAILED: blocking breaking change on a public module"
     exit 1
   fi
+  # AC-1 (fail-closed ratchet) on the pre-release channel: for each changed/absent
+  # module, dry-run prepare against the canonical clone so a PR targeting develop
+  # fails when its beta would land at/below the line's highest GA. prepare also
+  # validates the commit-hash-encoded version is legal SemVer.
+  if [[ "$PRERELEASE" == "1" ]]; then
+    for ((i=0; i<NMODULES; i++)); do
+      [[ "${STATUSES[$i]}" == "unchanged" ]] && continue
+      id="${IDS[$i]}"; line=$(echo "$id" | awk -F/ '{print $NF}')
+      ver=$(channel_version "${PUBVERS[$i]}" "$line")
+      if ! apx release prepare "$id" --version "$ver" --lifecycle beta \
+             --source-branch "$SRC_BRANCH" --encode-commit-hash \
+             --canonical-repo="$CANONICAL_REPO" --canonical-dir "$CANONICAL_DIR" \
+             --dry-run >"/tmp/ratchet.$i" 2>&1; then
+        note "> :x: Pre-release version gate failed for \`$id\` (base branch \`$BASE_BRANCH\`):"
+        note '```'; cat "/tmp/ratchet.$i" >> "$SUMMARY"; note '```'
+        log "check FAILED: pre-release gate for $id"; cat "/tmp/ratchet.$i" >&2
+        exit 1
+      fi
+    done
+  fi
   log "check complete (no blocking issues)"
   exit 0
 fi
@@ -231,22 +294,27 @@ publish_gitea() {
   : "${GITEA_URL:?}" "${GITEA_ORG:?}" "${GITEA_TOKEN:?}"
   local repo="${CANONICAL_REPO##*/}"; repo="${repo%.git}"
   local origin="http://${GITEA_URL#http*://}/${GITEA_ORG}/${repo}.git"
+  local base="$BASE_BRANCH"   # ARCH-271: target the resolved base branch
   # Auth via a per-invocation Authorization header — never a credential in the
   # clone/push URL argv (which git prints on error and would leak to logs).
   local -a gauth=(-c "http.extraHeader=Authorization: token ${GITEA_TOKEN}")
   local api="$GITEA_URL/api/v1/repos/$GITEA_ORG/$repo"
 
-  apx release prepare "$id" --version "$ver" --lifecycle "$lc" \
-    --canonical-repo="github.com/${GITEA_ORG}/${repo}" >/dev/null
+  local -a prep=(release prepare "$id" --version "$ver" --lifecycle "$lc"
+    --canonical-repo="github.com/${GITEA_ORG}/${repo}" --source-branch "$SRC_BRANCH")
+  [[ "$PRERELEASE" == "1" ]] && prep+=(--encode-commit-hash --canonical-dir "$CANONICAL_DIR")
+  apx "${prep[@]}" >/dev/null
   local tag gomod gomod_dir branch
+  # prepare may rewrite the version (commit-hash encoding) — read the final one.
+  ver=$(yq -r '.requested_version' .apx-release.yaml)
   tag=$(yq -r '.tag' .apx-release.yaml)
   gomod=$(yq -r '.languages.go.module' .apx-release.yaml)
   gomod_dir="${gomod#github.com/${GITEA_ORG}/${repo}/}"
   branch="apx/release/$(echo "$id" | tr '/' '-')/$ver"
 
   ( cd "$CANONICAL_DIR"
-    git checkout -q main >/dev/null 2>&1 || true
-    git "${gauth[@]}" pull -q "$origin" main >/dev/null 2>&1 || true
+    git checkout -q "$base" >/dev/null 2>&1 || git checkout -q -b "$base" "origin/$base" >/dev/null 2>&1 || true
+    git "${gauth[@]}" pull -q "$origin" "$base" >/dev/null 2>&1 || true
     git branch -D "$branch" >/dev/null 2>&1 || true
     git checkout -q -b "$branch"
     mkdir -p "$id"; cp "$OLDPWD/$spec" "$id/$name.yaml"
@@ -255,9 +323,9 @@ publish_gitea() {
     git "${gauth[@]}" push -q -f "$origin" "$branch" >/dev/null 2>&1 )
 
   local pr prnum pr_body
-  pr_body=$(jq -nc --arg t "release: ${id}@${ver}" --arg h "$branch" \
+  pr_body=$(jq -nc --arg t "release: ${id}@${ver}" --arg h "$branch" --arg base "$base" \
     --arg b "Automated API republish (apx publish-on-change)." \
-    '{title:$t, head:$h, base:"main", body:$b}')
+    '{title:$t, head:$h, base:$base, body:$b}')
   pr=$(curl -s -X POST "$api/pulls" -H "Authorization: token $GITEA_TOKEN" \
     -H "Content-Type: application/json" -d "$pr_body")
   prnum=$(echo "$pr" | jq -r '.number // empty')
@@ -281,23 +349,30 @@ publish_gitea() {
       curl -s "$api/pulls/$prnum" -H "Authorization: token $GITEA_TOKEN" -o /dev/null
     done
     ( cd "$CANONICAL_DIR"
-      git checkout -q main >/dev/null 2>&1 || true
-      git "${gauth[@]}" pull -q "$origin" main >/dev/null 2>&1 || true
-      CI=true apx release finalize --api "$id" --version "$ver" --lifecycle "$lc" --local >&2 || true
+      git checkout -q "$base" >/dev/null 2>&1 || true
+      git "${gauth[@]}" pull -q "$origin" "$base" >/dev/null 2>&1 || true
+      CI=true apx release finalize --api "$id" --version "$ver" --lifecycle "$lc" \
+        --base-branch "$base" --local >&2 || true
       cp catalog.yaml catalog/catalog.yaml 2>/dev/null || true
       git add -A && git commit -q -m "catalog: record ${id}@${ver}" || true
-      git "${gauth[@]}" push -q "$origin" main >/dev/null 2>&1 || true
+      git "${gauth[@]}" push -q "$origin" "$base" >/dev/null 2>&1 || true
       git "${gauth[@]}" push -q "$origin" "$tag" >/dev/null 2>&1 || true )
-    log "merged + finalized $id@$ver (sandbox demo)"
+    log "merged + finalized $id@$ver on $base (sandbox demo)"
   fi
 }
 
 publish_github() {
   local id="$1" ver="$2" lc="$3"
   : "${GITHUB_TOKEN:?GITHUB_TOKEN required for github publish}"
-  apx release prepare "$id" --version "$ver" --lifecycle "$lc" --canonical-repo="$CANONICAL_REPO" >/dev/null
-  apx release submit   # native PR on GitHub
-  note "- \`$id\` → submitted publish PR ($ver)"
+  local -a prep=(release prepare "$id" --version "$ver" --lifecycle "$lc"
+    --canonical-repo="$CANONICAL_REPO" --source-branch "$SRC_BRANCH")
+  # ARCH-271 pre-release channel: encode the commit hash and run the ratchet
+  # against the canonical clone at prepare time.
+  [[ "$PRERELEASE" == "1" ]] && prep+=(--encode-commit-hash --canonical-dir "$CANONICAL_DIR")
+  apx "${prep[@]}" >/dev/null
+  ver=$(yq -r '.requested_version' .apx-release.yaml)   # may be hash-encoded
+  apx release submit   # native PR on GitHub → targets the manifest's base branch
+  note "- \`$id\` → submitted publish PR ($ver, base \`$BASE_BRANCH\`)"
   # Drift issue via GitHub REST.
   jq -nc --arg t "catalog drift: ${id} needs publish (${ver})" \
     --arg b "Automated publish PR opened by apx publish-on-change." \
@@ -318,12 +393,13 @@ for ((i=0; i<NMODULES; i++)); do
   fi
   published_any=1
   ID="${IDS[$i]}"; LINE=$(echo "$ID" | awk -F/ '{print $NF}')
-  VER=$(next_version "${PUBVERS[$i]}" "$LINE")
-  log "publish $ID ($ST) -> $VER"
+  VER=$(channel_version "${PUBVERS[$i]}" "$LINE")
+  LC=$(channel_lifecycle "${LIFECYCLES[$i]}")
+  log "publish $ID ($ST) -> $VER [$LC, base $BASE_BRANCH]"
   if [[ "$FORGE" == "gitea" ]]; then
-    publish_gitea "$ID" "$VER" "${LIFECYCLES[$i]}" "${NAMES[$i]}" "${SPECFILES[$i]}"
+    publish_gitea "$ID" "$VER" "$LC" "${NAMES[$i]}" "${SPECFILES[$i]}"
   else
-    publish_github "$ID" "$VER" "${LIFECYCLES[$i]}"
+    publish_github "$ID" "$VER" "$LC"
   fi
 done
 [[ "$published_any" == "0" ]] && note "- all modules in sync — nothing to publish"

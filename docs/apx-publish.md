@@ -103,6 +103,10 @@ apx pathlint --ingress <rendered> --spec <specs> --warn-only   # path reconcilia
    fds_target: fds
    converter_version: v0.60.0
    version_bump: minor
+   # branch_targets:               # optional (ARCH-271) — service source branch →
+   #   main: main                  # apis base branch. Default main/master→main,
+   #   master: main                # develop→develop; tweakable. A base branch other
+   #   develop: develop            # than main is a pre-release (beta) channel.
    # fds_key_files:                # optional — files that determine the FDS bytes.
    #   - '**/*.proto'              # default: all protos + every Makefile* (the
    #   - '**/Makefile*'            # gentool pin + includes). Override only if your
@@ -185,6 +189,12 @@ no network and works with any forge.
   as `changed`/`breaking` against a fresh convert — let the workflow own the spec.
 - **Version:** `version_bump` (default `minor`) bumps the latest published version;
   a first publish uses `v<line>.0.0`.
+- **Branch routing (ARCH-271):** the source branch (`github.ref_name`) resolves
+  through `branch_targets` to the catalog base branch. main/master publish stable
+  to apis `main`; develop publishes to apis `develop` as pre-releases
+  (`vX.Y.Z-beta.N` carrying a short commit hash, e.g. `v1.2.0-beta.1.g1a2b3c4d5e6f`).
+  A fail-closed ratchet rejects a beta at or below the line's highest GA — the PR
+  check fails, and so does the develop-branch publish before tagging.
 - **Gateway era:** read the actual `--swagger_out` vs `--openapiv2_out` flag from the
   repo's Makefile when onboarding; do not infer it from the gentool tag.
 - **Converter:** v0.60.0 made tolerant `(verb,path)`-from-FDS matching the default

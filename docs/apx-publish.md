@@ -189,12 +189,19 @@ no network and works with any forge.
   as `changed`/`breaking` against a fresh convert — let the workflow own the spec.
 - **Version:** `version_bump` (default `minor`) bumps the latest published version;
   a first publish uses `v<line>.0.0`.
-- **Branch routing (ARCH-271):** the source branch (`github.ref_name`) resolves
-  through `branch_targets` to the catalog base branch. main/master publish stable
-  to apis `main`; develop publishes to apis `develop` as pre-releases
-  (`vX.Y.Z-beta.N` carrying a short commit hash, e.g. `v1.2.0-beta.1.g1a2b3c4d5e6f`).
-  A fail-closed ratchet rejects a beta at or below the line's highest GA — the PR
-  check fails, and so does the develop-branch publish before tagging.
+- **Branch routing (ARCH-271):** the source branch resolves through
+  `branch_targets` to the catalog base branch. main/master publish stable to apis
+  `main`; develop publishes to apis `develop` as pre-releases (`vX.Y.Z-beta.N`
+  carrying a short commit hash, e.g. `v1.2.0-beta.1.g1a2b3c4d5e6f`). A fail-closed
+  ratchet rejects a beta at or below the line's highest GA — the PR check fails,
+  and so does the develop-branch publish before tagging. The routing branch is
+  event-aware: on **push** it is the pushed branch (`github.ref_name`); on a
+  **pull_request** it is the PR's **base branch** (`github.base_ref`) — the branch
+  the PR merges into — because `github.ref_name` there is the `<PR#>/merge` ref,
+  which routes to no channel. Keying the check on the base branch makes a PR into
+  `develop` run the pre-release channel and its ratchet (a real pre-merge gate),
+  and a PR into `main`/`master` run the stable channel — matching the publish that
+  the merge will trigger.
 - **Gateway era:** read the actual `--swagger_out` vs `--openapiv2_out` flag from the
   repo's Makefile when onboarding; do not infer it from the gentool tag.
 - **Converter:** v0.60.0 made tolerant `(verb,path)`-from-FDS matching the default

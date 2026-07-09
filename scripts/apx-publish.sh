@@ -92,7 +92,16 @@ CANON_NWO=$(echo "$CANONICAL_REPO" | sed -E 's#^https?://##; s#\.git$##; s#^[^/]
 # than "main" is a PRE-RELEASE channel: apx publishes vX.Y.Z-beta.N versions that
 # carry a short commit hash, and its ratchet keeps them above the line's GA.
 default_base() { case "$1" in main|master) echo main;; develop) echo develop;; *) echo main;; esac; }
-SRC_BRANCH="${GITHUB_REF_NAME:-$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)}"
+# Which branch drives channel routing depends on the event:
+#   push (publish): GITHUB_REF_NAME is the pushed branch (develop/master) — the
+#     branch whose merge just happened, so route on it directly.
+#   pull_request (check): GITHUB_REF_NAME is the merge ref "<PR#>/merge", which
+#     maps to no channel and would wrongly fall back to main — so prefer
+#     GITHUB_BASE_REF, the branch the PR MERGES INTO. That is precisely the
+#     branch whose post-merge push will trigger publish, so the check runs the
+#     SAME channel (and, for develop, the AC-1 pre-release ratchet) as the
+#     eventual publish — a true pre-merge gate rather than an always-main report.
+SRC_BRANCH="${GITHUB_BASE_REF:-${GITHUB_REF_NAME:-$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)}}"
 BASE_BRANCH=$(yq -r ".branch_targets.\"$SRC_BRANCH\" // \"\"" "$CONFIG")
 [[ -n "$BASE_BRANCH" && "$BASE_BRANCH" != "null" ]] || BASE_BRANCH=$(default_base "$SRC_BRANCH")
 PRERELEASE=0; [[ "$BASE_BRANCH" != "main" ]] && PRERELEASE=1

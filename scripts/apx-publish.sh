@@ -44,6 +44,7 @@ CONFIG=".apx-publish.yaml"
 MODULE_ROOT="build/apx-modules"
 CANONICAL_DIR=""
 BREAKING_GATE="auto"
+VERIFY_CLIENTS="fail"
 PATHLINT_INGRESS=""
 AUTO_MERGE=0
 SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/stdout}"
@@ -55,6 +56,7 @@ while [[ $# -gt 0 ]]; do
     --module-root) MODULE_ROOT="$2"; shift 2 ;;
     --canonical-dir) CANONICAL_DIR="$2"; shift 2 ;;
     --breaking-gate) BREAKING_GATE="$2"; shift 2 ;;
+    --verify-clients) VERIFY_CLIENTS="$2"; shift 2 ;;
     --pathlint-ingress) PATHLINT_INGRESS="$2"; shift 2 ;;
     --auto-merge) AUTO_MERGE=1; shift ;;
     --summary) SUMMARY="$2"; shift 2 ;;
@@ -81,6 +83,12 @@ VERSION_BUMP=$(yq -r '.version_bump // "minor"' "$CONFIG")
 PATHLINT_CHART=$(yq -r '.pathlint.chart // ""' "$CONFIG")
 PATHLINT_RELEASE=$(yq -r '.pathlint.release_name // "release"' "$CONFIG")
 NMODULES=$(yq -r '.modules | length' "$CONFIG")
+
+# Client-build gate (apx client verify): which generators to build+compile per
+# module. Default: go (the SDK the reserved-identifier / redundant-param hazards
+# break). Override per repo via .apx-publish.yaml `verify_clients.generators`.
+mapfile -t VERIFY_GENERATORS < <(yq -r '.verify_clients.generators[]?' "$CONFIG")
+[[ ${#VERIFY_GENERATORS[@]} -gt 0 ]] || VERIFY_GENERATORS=(go)
 
 # github.com-style NWO used by apx for identity/go-module derivation (even on gitea).
 CANON_NWO=$(echo "$CANONICAL_REPO" | sed -E 's#^https?://##; s#\.git$##; s#^[^/]+/##')
@@ -124,6 +132,18 @@ note ""
 note "Canonical: \`$CANONICAL_REPO\` · forge: \`$FORGE\` · modules: $NMODULES"
 note "Source branch: \`$SRC_BRANCH\` → base branch: \`$BASE_BRANCH\`$([[ "$PRERELEASE" == "1" ]] && echo ' (pre-release / beta channel)')"
 note ""
+
+# ── Client-build gate mode ────────────────────────────────────────────────────
+# fail (default): generate an SDK from each converted spec and compile it; a spec
+#   whose client does not build FAILS the run (in check AND publish) before any
+#   publish PR is opened. warn: report only. off: skip. This makes an apx that
+#   ships `apx client verify` a hard prerequisite of the toolchain image.
+case "$VERIFY_CLIENTS" in
+  fail|warn|off) : ;;
+  "") VERIFY_CLIENTS="fail" ;;
+  *) echo "invalid --verify-clients: $VERIFY_CLIENTS (fail|warn|off)" >&2; exit 2 ;;
+esac
+log "verify-clients=$VERIFY_CLIENTS generators=${VERIFY_GENERATORS[*]}"
 
 # ── openapiv2to3 (converter) ──────────────────────────────────────────────────
 if ! command -v openapiv2to3 >/dev/null; then
@@ -183,12 +203,12 @@ channel_version() {
 channel_lifecycle() { if [[ "$PRERELEASE" == "1" ]]; then echo beta; else echo "$1"; fi; }
 
 # Staged converted specs, and per-module status, collected for the summary + publish.
-declare -a IDS NAMES LIFECYCLES SPECFILES STATUSES PUBVERS BLOCKED
+declare -a IDS NAMES LIFECYCLES SPECFILES STATUSES PUBVERS BLOCKED SDK_BAD
 SPEC_ARGS=()
 
 # ── Convert + analyze each module ─────────────────────────────────────────────
-note "| module | audience | drift | published | breaking |"
-note "|--------|----------|-------|-----------|----------|"
+note "| module | audience | drift | published | breaking | sdk |"
+note "|--------|----------|-------|-----------|----------|-----|"
 
 for ((i=0; i<NMODULES; i++)); do
   ID=$(yq -r ".modules[$i].id" "$CONFIG")
@@ -237,13 +257,51 @@ for ((i=0; i<NMODULES; i++)); do
     fi
   fi
 
-  note "| \`$ID\` | $AUD | $STATUS | ${PUBVER:-–} | $BREAKING |"
+  # SDK build gate: generate a client from the converted spec and compile it, so
+  # a spec that cannot produce a buildable client is caught before publish. The
+  # run-level gate below turns SDK_BAD into a hard failure (fail) or a warning.
+  SDK="n/a"; sdk_bad=0
+  if [[ "$VERIFY_CLIENTS" != "off" ]]; then
+    verify_args=(client verify --input "$SPEC")
+    for g in "${VERIFY_GENERATORS[@]}"; do verify_args+=(--generator "$g"); done
+    if apx "${verify_args[@]}" >"/tmp/verify.$i" 2>&1; then
+      SDK="ok"
+    else
+      SDK="**does not build**"; sdk_bad=1
+    fi
+  fi
+
+  note "| \`$ID\` | $AUD | $STATUS | ${PUBVER:-–} | $BREAKING | $SDK |"
 
   IDS[$i]="$ID"; NAMES[$i]="$NAME"; LIFECYCLES[$i]="$LC"
-  SPECFILES[$i]="$SPEC"; STATUSES[$i]="$STATUS"; PUBVERS[$i]="$PUBVER"; BLOCKED[$i]="$blocked"
+  SPECFILES[$i]="$SPEC"; STATUSES[$i]="$STATUS"; PUBVERS[$i]="$PUBVER"; BLOCKED[$i]="$blocked"; SDK_BAD[$i]="$sdk_bad"
   SPEC_ARGS+=(--spec "$SPEC")
 done
 note ""
+
+# ── Client-build gate (apx client verify) ─────────────────────────────────────
+# A spec can pass lint/breaking yet generate a client that does not compile
+# (e.g. a reserved-identifier path param shadowing an import, or redundant params
+# colliding on one field). `fail` (default) stops the run before any publish;
+# `warn` reports only; `off` skips. See infobloxopen/apx#42.
+if [[ "$VERIFY_CLIENTS" != "off" ]]; then
+  anysdk=0
+  for ((i=0; i<NMODULES; i++)); do [[ "${SDK_BAD[$i]}" == "1" ]] && anysdk=1; done
+  if [[ "$anysdk" == "1" ]]; then
+    for ((i=0; i<NMODULES; i++)); do
+      [[ "${SDK_BAD[$i]}" == "1" ]] || continue
+      note "<details><summary>SDK build report — <code>${IDS[$i]}</code></summary>"
+      note ""; note '```'; cat "/tmp/verify.$i" >> "$SUMMARY"; note '```'; note "</details>"; note ""
+    done
+    if [[ "$VERIFY_CLIENTS" == "fail" ]]; then
+      note "> :x: Generated client does not build — failing the run (set \`verify-clients: warn\` or \`off\` to downgrade)."
+      log "FAILED: generated client does not build (see SDK build report)"
+      exit 1
+    fi
+    note "> :warning: Generated client does not build (advisory — \`verify-clients: warn\`)."
+    note ""
+  fi
+fi
 
 # ── Path-reconciliation lint (R4: metric, not a gate) ─────────────────────────
 render_ingress() {

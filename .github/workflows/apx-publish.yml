@@ -42,6 +42,11 @@ on:
         required: false
         type: string
         default: 'auto'
+      verify-clients:
+        description: 'apx client verify gate: fail (default) | warn | off. Generates an SDK from each converted spec and compiles it; fail stops the run when a client does not build. Requires the apx-toolchain image to provide `apx client verify` (see infobloxopen/apx#42).'
+        required: false
+        type: string
+        default: 'fail'
       auto-merge:
         description: '(gitea sandbox only) merge the publish PR + finalize to demo the catalog updating'
         required: false
@@ -208,6 +213,7 @@ jobs:
           APX_MODE: ${{ inputs.mode }}
           APX_CONFIG: ${{ inputs.config }}
           APX_BREAKING_GATE: ${{ inputs.breaking-gate }}
+          APX_VERIFY_CLIENTS: ${{ inputs.verify-clients }}
           APX_AUTO_MERGE: ${{ inputs.auto-merge }}
         run: |
           set -euo pipefail
@@ -227,6 +233,6 @@ jobs:
           git config --global user.name "apx-submit[bot]"
           git config --global user.email "apx-submit[bot]@users.noreply.github.com"
           chmod +x _apx_action/scripts/apx-publish.sh
-          args=(--mode "$APX_MODE" --config "$APX_CONFIG" --canonical-dir .canonical --breaking-gate "$APX_BREAKING_GATE")
+          args=(--mode "$APX_MODE" --config "$APX_CONFIG" --canonical-dir .canonical --breaking-gate "$APX_BREAKING_GATE" --verify-clients "$APX_VERIFY_CLIENTS")
           [[ "$APX_AUTO_MERGE" == "true" ]] && args+=(--auto-merge)
           _apx_action/scripts/apx-publish.sh "${args[@]}"

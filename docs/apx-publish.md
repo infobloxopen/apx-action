@@ -71,11 +71,36 @@ make <fds_target>                     # the repo's OWN pinned gentool: --descrip
 openapiv2to3 -descriptor <fds> <swagger> <out>   # enriched OpenAPI v3 (v0.60.0; tolerant matching is the default)
 apx release status <id> --canonical-dir <clone>  # drift: unchanged | changed | absent (schema-scoped, ignores go.mod)
 apx breaking <new> --against <published>          # public = blocking, internal = advisory
+apx client verify --input <spec> --generator go   # SDK build gate: generate + compile the client (fail by default)
 apx pathlint --ingress <rendered> --spec <specs> --warn-only   # path reconciliation — a metric, never a gate (R4)
 ```
 
-- **check** (PR): report drift + breaking + path-reconciliation. Fails only on a
-  **blocking breaking change to a public module**; everything else is a report.
+### SDK build gate (`verify-clients`)
+
+A spec can pass `lint`/`breaking` yet still generate a client that does not
+compile — e.g. a path parameter named `url` that shadows the `net/url` import,
+or redundant `limit`/`offset` params that collide with `_limit`/`_offset` on one
+Go field (see [`infobloxopen/apx`#42](https://github.com/infobloxopen/apx/pull/42)).
+For each converted spec the pipeline runs `apx client verify`, which generates a
+client and **compiles** it.
+
+The `verify-clients` workflow input controls the gate:
+
+| value | behavior |
+|-------|----------|
+| `fail` (default) | generate + compile every module's client; **fail the run** (check *and* publish, before any publish PR) if one does not build |
+| `warn` | run and report, never fail |
+| `off` | skip the gate |
+
+Generators default to `go`; override per repo with `verify_clients.generators`
+in `.apx-publish.yaml`. Because the default is `fail`, the prebuilt
+`apx-toolchain` image **must** provide `apx client verify` — a stale image
+without it will fail publishes (by design). Rebuild the toolchain image from an
+apx that includes the command before adopting.
+
+- **check** (PR): report drift + breaking + path-reconciliation. Fails on a
+  **blocking breaking change to a public module** or a **client that does not
+  build** (`verify-clients: fail`); everything else is a report.
 - **publish** (push to default branch): for each module whose API `changed` or is
   `absent`, open a **PR into the catalog** and a **drift issue**. Public modules
   with a blocking breaking change are skipped (not silently published).

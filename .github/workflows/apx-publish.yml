@@ -43,10 +43,10 @@ on:
         type: string
         default: 'auto'
       verify-clients:
-        description: 'apx client verify gate: fail (default) | warn | off. Generates an SDK from each converted spec and compiles it; fail stops the run when a client does not build. Requires the apx-toolchain image to provide `apx client verify` (see infobloxopen/apx#42).'
+        description: 'apx client verify gate: warn (current default) | fail | off. Generates an SDK from each converted spec and compiles it; fail stops the run when a client does not build, warn only reports. Requires the apx-toolchain image to provide `apx client verify` (see infobloxopen/apx#42). NOTE: the default is temporarily `warn` during rollout; it will move to `fail` once active publishers produce building clients.'
         required: false
         type: string
-        default: 'fail'
+        default: 'warn'
       auto-merge:
         description: '(gitea sandbox only) merge the publish PR + finalize to demo the catalog updating'
         required: false

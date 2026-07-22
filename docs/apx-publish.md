@@ -108,6 +108,27 @@ includes the command (>= v0.21.0) before switching the default to `fail`.
   `absent`, open a **PR into the catalog** and a **drift issue**. Public modules
   with a blocking breaking change are skipped (not silently published).
 
+### Superseding prior beta PRs (`supersede`)
+
+Catalog release PRs are review-gated (CODEOWNERS) and not auto-merged, so if a
+module's API changes again before its prior beta PR is merged, publish opens a new
+PR while the old one lingers — stale betas pile up, each recomputing `-beta.1`
+because the base never advances.
+
+On publish, after opening the new PR for a module, the pipeline finds every other
+**open** `apx/release/<module-id>/*` PR on the **same base branch**, and on each:
+comments `Superseded by #<new>`, applies the `superseded` label (created if
+absent), **closes** it, and **deletes** its head branch. The PR kept is the one
+whose branch matches the just-published version, or — as a safety net — the newest
+by creation time, so the fresh PR is never the one closed.
+
+The `supersede` workflow input controls it: `on` (default) or `off`. It is
+`github` forge only and **best-effort** — any API error is logged and never fails
+the publish run. Rename the label per repo with `supersede.label` in
+`.apx-publish.yaml`. Uses the same least-privilege submit-App token (no new
+scopes: `pull_requests:write` + `issues:write` already cover close/label/comment/
+delete-branch).
+
 ## Adopt in a service repo (three files)
 
 1. **`make fds`** — add one target that emits a FileDescriptorSet per surface via
@@ -131,6 +152,8 @@ includes the command (>= v0.21.0) before switching the default to `fail`.
    fds_target: fds
    converter_version: v0.60.0
    version_bump: minor
+   # supersede:                    # optional (CICD-1378) — auto-close prior beta PRs
+   #   label: superseded           # label for closed superseded PRs (default `superseded`)
    # branch_targets:               # optional (ARCH-271) — service source branch →
    #   main: main                  # apis base branch. Default main/master→main,
    #   master: main                # develop→develop; tweakable. A base branch other

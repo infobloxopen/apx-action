@@ -45,6 +45,7 @@ MODULE_ROOT="build/apx-modules"
 CANONICAL_DIR=""
 BREAKING_GATE="auto"
 VERIFY_CLIENTS="fail"
+SUPERSEDE="on"
 PATHLINT_INGRESS=""
 AUTO_MERGE=0
 SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/stdout}"
@@ -57,6 +58,7 @@ while [[ $# -gt 0 ]]; do
     --canonical-dir) CANONICAL_DIR="$2"; shift 2 ;;
     --breaking-gate) BREAKING_GATE="$2"; shift 2 ;;
     --verify-clients) VERIFY_CLIENTS="$2"; shift 2 ;;
+    --supersede) SUPERSEDE="$2"; shift 2 ;;
     --pathlint-ingress) PATHLINT_INGRESS="$2"; shift 2 ;;
     --auto-merge) AUTO_MERGE=1; shift ;;
     --summary) SUMMARY="$2"; shift 2 ;;
@@ -74,6 +76,12 @@ command -v apx >/dev/null || { echo "apx is required on PATH" >&2; exit 2; }
 log()  { echo "==> $*" >&2; }
 note() { echo "$*" >> "$SUMMARY"; }
 
+# Superseded-PR cleanup (CICD-1378) lives in a sibling helper so it can be unit-
+# tested in isolation. Source it after log()/note() so it reuses them.
+_APX_PUBLISH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/supersede.sh
+source "$_APX_PUBLISH_DIR/supersede.sh"
+
 # ── Config ──────────────────────────────────────────────────────────────────
 CANONICAL_REPO=$(yq -r '.canonical_repo' "$CONFIG")
 FORGE=$(yq -r '.forge // "github"' "$CONFIG")
@@ -83,6 +91,9 @@ VERSION_BUMP=$(yq -r '.version_bump // "minor"' "$CONFIG")
 PATHLINT_CHART=$(yq -r '.pathlint.chart // ""' "$CONFIG")
 PATHLINT_RELEASE=$(yq -r '.pathlint.release_name // "release"' "$CONFIG")
 NMODULES=$(yq -r '.modules | length' "$CONFIG")
+
+# Superseded-PR cleanup (CICD-1378): the label applied to auto-closed prior PRs.
+SUPERSEDE_LABEL=$(yq -r '.supersede.label // "superseded"' "$CONFIG")
 
 # Client-build gate (apx client verify): which generators to build+compile per
 # module. Default: go (the SDK the reserved-identifier / redundant-param hazards
@@ -144,6 +155,16 @@ case "$VERIFY_CLIENTS" in
   *) echo "invalid --verify-clients: $VERIFY_CLIENTS (fail|warn|off)" >&2; exit 2 ;;
 esac
 log "verify-clients=$VERIFY_CLIENTS generators=${VERIFY_GENERATORS[*]}"
+
+# ── Superseded-PR cleanup mode (CICD-1378) ────────────────────────────────────
+# on (default): after opening a new beta PR for a module, close any prior open
+#   apx/release PR for the same module id + base branch (label + comment + delete
+#   branch). off: leave prior PRs alone. github forge only; best-effort.
+case "$SUPERSEDE" in
+  on|off) : ;;
+  *) echo "invalid --supersede: $SUPERSEDE (on|off)" >&2; exit 2 ;;
+esac
+log "supersede=$SUPERSEDE label=$SUPERSEDE_LABEL"
 
 # ── openapiv2to3 (converter) ──────────────────────────────────────────────────
 if ! command -v openapiv2to3 >/dev/null; then
@@ -447,6 +468,9 @@ publish_github() {
   | curl -s -X POST "https://api.github.com/repos/${CANON_NWO}/issues" \
     -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" \
     -d @- -o /dev/null || true
+  # CICD-1378: this new PR supersedes any earlier open PR for the same module id
+  # on this base branch — close them so stale betas don't pile up. Best-effort.
+  supersede_prs "$id" "$ver" || true
 }
 
 note "### Publish"

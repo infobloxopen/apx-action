@@ -47,6 +47,11 @@ on:
         required: false
         type: string
         default: 'warn'
+      supersede:
+        description: 'on (default) | off. On publish, after opening a new beta PR for a module, auto-close any prior OPEN apx/release PR for the same module id + base branch — label it (see .apx-publish.yaml supersede.label, default `superseded`), comment "Superseded by #N", and delete its head branch — so stale beta PRs do not pile up. github forge only; best-effort (never fails the run).'
+        required: false
+        type: string
+        default: 'on'
       auto-merge:
         description: '(gitea sandbox only) merge the publish PR + finalize to demo the catalog updating'
         required: false
@@ -214,6 +219,7 @@ jobs:
           APX_CONFIG: ${{ inputs.config }}
           APX_BREAKING_GATE: ${{ inputs.breaking-gate }}
           APX_VERIFY_CLIENTS: ${{ inputs.verify-clients }}
+          APX_SUPERSEDE: ${{ inputs.supersede }}
           APX_AUTO_MERGE: ${{ inputs.auto-merge }}
         run: |
           set -euo pipefail
@@ -233,6 +239,6 @@ jobs:
           git config --global user.name "apx-submit[bot]"
           git config --global user.email "apx-submit[bot]@users.noreply.github.com"
           chmod +x _apx_action/scripts/apx-publish.sh
-          args=(--mode "$APX_MODE" --config "$APX_CONFIG" --canonical-dir .canonical --breaking-gate "$APX_BREAKING_GATE" --verify-clients "$APX_VERIFY_CLIENTS")
+          args=(--mode "$APX_MODE" --config "$APX_CONFIG" --canonical-dir .canonical --breaking-gate "$APX_BREAKING_GATE" --verify-clients "$APX_VERIFY_CLIENTS" --supersede "$APX_SUPERSEDE")
           [[ "$APX_AUTO_MERGE" == "true" ]] && args+=(--auto-merge)
           _apx_action/scripts/apx-publish.sh "${args[@]}"

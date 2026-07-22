@@ -1,0 +1,22 @@
+# CI for the apx-action repo itself: lint the publish engine's helper scripts and
+# run their unit tests. (The reusable apx-publish.yml is exercised end to end by
+# consuming repos; this guards the shell logic that ships in the toolchain.)
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: shellcheck (publish engine + helpers)
+        run: shellcheck scripts/supersede.sh tests/supersede_test.sh
+      - name: supersede unit test (CICD-1378)
+        run: bash tests/supersede_test.sh

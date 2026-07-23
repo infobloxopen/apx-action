@@ -88,18 +88,19 @@ The `verify-clients` workflow input controls the gate:
 
 | value | behavior |
 |-------|----------|
-| `warn` (current default) | run and report, never fail |
-| `fail` | generate + compile every module's client; **fail the run** (check *and* publish, before any publish PR) if one does not build |
+| `fail` (default) | generate + compile every module's client; **fail the run** (check *and* publish, before any publish PR) if one does not build |
+| `warn` | run and report, never fail |
 | `off` | skip the gate |
 
-> **Rollout:** the default is temporarily `warn` while active publishers adopt
-> the fix; it will move to `fail` (hard gate, opt-out) once their clients build.
+> **Default `fail`** (hard gate, opt-out): a spec that cannot produce a building
+> client blocks the run. Set `warn` to downgrade to advisory, or `off` to skip.
+> The catalog also enforces this at the boundary as a required check (CICD-1379).
 
 Generators default to `go`; override per repo with `verify_clients.generators`
 in `.apx-publish.yaml`. The gate needs the prebuilt `apx-toolchain` image to
-provide `apx client verify` — a stale image without it will error (under `fail`,
-that fails the publish by design). Rebuild the toolchain image from an apx that
-includes the command (>= v0.21.0) before switching the default to `fail`.
+provide `apx client verify` — a stale image without it will error, which (with
+the default `fail`) fails the run by design. Keep the toolchain image built from
+an apx that includes the command (>= v0.21.0).
 
 - **check** (PR): report drift + breaking + path-reconciliation. Fails on a
   **blocking breaking change to a public module** or a **client that does not

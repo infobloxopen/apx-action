@@ -118,13 +118,23 @@ jobs:
           APX_CONFIG: ${{ inputs.config }}
         run: |
           set -euo pipefail
-          # Paths the modules reference (repo-relative; may be scattered), emitted
-          # as a multiline output for actions/cache to restore + save.
+          # Only fds-bearing modules (openapi/proto — the formats whose emit reads a
+          # FileDescriptorSet) contribute to the FDS cache. Their `fds:` paths are
+          # emitted as a multiline output for actions/cache to restore + save. A repo
+          # of only crd / message-schema modules has no FDS, so both the path set and
+          # the key collapse to a no-op that the cache step skips.
+          mapfile -t fds_paths < <(yq -r '.modules[] | select(.fds) | .fds' "$APX_CONFIG" | sort -u)
           {
             echo 'paths<<EOF'
-            yq -r '.modules[].fds' "$APX_CONFIG" | sort -u
+            [[ ${#fds_paths[@]} -gt 0 ]] && printf '%s\n' "${fds_paths[@]}"
             echo EOF
           } >> "$GITHUB_OUTPUT"
+
+          if [[ ${#fds_paths[@]} -eq 0 ]]; then
+            echo "no fds-bearing modules (crd/message-schema only) — FDS cache is a no-op"
+            echo "key_hash=none" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           # Cache key = a content hash of EVERY file that determines the FDS bytes:
           #   1. all protos in the compile closure (repo-local imports included);
@@ -148,6 +158,8 @@ jobs:
           echo "key_hash=$key_hash" >> "$GITHUB_OUTPUT"
 
       - name: Cache FileDescriptorSet(s)
+        # crd/message-schema-only repos produce no FDS (key_hash=none) — skip caching.
+        if: steps.fds.outputs.key_hash != 'none'
         uses: actions/cache@v4
         with:
           path: ${{ steps.fds.outputs.paths }}

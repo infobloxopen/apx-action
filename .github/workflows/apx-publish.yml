@@ -43,10 +43,10 @@ on:
         type: string
         default: 'auto'
       verify-clients:
-        description: 'apx client verify gate: warn (current default) | fail | off. Generates an SDK from each converted spec and compiles it; fail stops the run when a client does not build, warn only reports. Requires the apx-toolchain image to provide `apx client verify` (see infobloxopen/apx#42). NOTE: the default is temporarily `warn` during rollout; it will move to `fail` once active publishers produce building clients.'
+        description: 'apx client verify gate: fail (default) | warn | off. Generates an SDK from each converted spec and compiles it; fail stops the run when a client does not build, warn only reports, off skips. Requires the apx-toolchain image to provide `apx client verify` (see infobloxopen/apx#42). Default is `fail`: a spec that cannot produce a building client blocks the run (set `warn` to downgrade to advisory, or `off` to skip).'
         required: false
         type: string
-        default: 'warn'
+        default: 'fail'
       supersede:
         description: 'on (default) | off. On publish, after opening a new beta PR for a module, auto-close any prior OPEN apx/release PR for the same module id + base branch — label it (see .apx-publish.yaml supersede.label, default `superseded`), comment "Superseded by #N", and delete its head branch — so stale beta PRs do not pile up. github forge only; best-effort (never fails the run).'
         required: false

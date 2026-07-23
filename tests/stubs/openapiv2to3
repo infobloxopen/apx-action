@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Test stub for the openapiv2to3 converter. Invoked as:
+#   openapiv2to3 -descriptor <fds> <swagger> <out-dir>
+# Records the call and writes exactly one <name>.openapi.yaml into <out-dir>, which
+# is what the real converter emits and what apx-publish.sh moves into place.
+echo "openapiv2to3 $*" >> "${APX_TEST_LOG:?APX_TEST_LOG must be set}"
+
+out="$4"
+mkdir -p "$out"
+cat > "$out/stub.openapi.yaml" <<'YAML'
+openapi: 3.0.0
+info:
+  title: stub
+  version: 1.0.0
+paths: {}
+YAML

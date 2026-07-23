@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Test stub for the apx CLI. Records every invocation to $APX_TEST_LOG and returns
+# canned output so tests can drive scripts/apx-publish.sh without a real apx.
+#   release status → JSON drift result (absent = first publish, nothing to compare)
+#   breaking / client verify → succeed (exit 0)
+# The drift status can be overridden per run with $STUB_DRIFT_STATUS.
+echo "apx $*" >> "${APX_TEST_LOG:?APX_TEST_LOG must be set}"
+
+case "${1:-}" in
+  release)
+    case "${2:-}" in
+      status)
+        printf '{"status":"%s","published_version":"%s"}\n' \
+          "${STUB_DRIFT_STATUS:-absent}" "${STUB_PUBLISHED_VERSION:-}" ;;
+      *) : ;;
+    esac ;;
+  breaking) : ;;   # no breaking change
+  client)   : ;;   # `client verify` — generated client builds
+  *)        : ;;
+esac
+exit 0

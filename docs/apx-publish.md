@@ -64,7 +64,101 @@ converter cut a release, so floating-tag consumers get the newest set as a fast 
 *pull*, never a compile; the validators (buf/spectral/oasdiff/protoc-gen-go[-grpc])
 stay pinned for reproducibility.
 
+## Formats
+
+One repo can publish any mix of apx's six schema formats — `openapi`, `crd`,
+`proto`, `avro`, `jsonschema`, `parquet` — from a single `.apx-publish.yaml`. Each
+module declares only the source its format needs; the workflow loops over the
+modules, runs the correct **emit step** for each, then runs one common
+validate-and-publish tail (`status → breaking → verify-clients → pathlint →
+release`).
+
+A module's format is **inferred from the first segment of its id**
+(`crd/csp.platform.infoblox.com/cspaccountclaim/v1alpha1` → `crd`); an explicit
+`format:` field overrides. The catalog path is the id, so a module lands under its
+format's subtree (`/openapi`, `/crd`, …) by construction.
+
+| Format | Source field(s) | Emit step | Staged as | `verify-clients` default | Catalog path |
+|---|---|---|---|---|---|
+| `openapi` | `swagger` + `fds` | `make <fds_target>` → `openapiv2to3` | `<name>.yaml` | on (client) | `/openapi` |
+| `crd` | `crd` | none — CRD YAML used directly | `<name>.yaml` | on (client) | `/crd` |
+| `proto` | `fds` | none — FDS used directly | `<name>.binpb` | on (client) | `/proto` |
+| `jsonschema` | `jsonschema` | none | `<name>.json` | off | `/jsonschema` |
+| `avro` | `avro` | none | `<name>.avsc` | off | `/avro` |
+| `parquet` | `parquet` | none | `<name>.parquet` | off | `/parquet` |
+
+Only `openapi` runs the OpenAPI toolchain (`make <fds_target>` → `openapiv2to3`);
+every other format uses its committed source verbatim. `make <fds_target>` runs
+once for the fds-bearing modules and is **skipped entirely** for a repo of only
+crd / message-schema modules.
+
+**Versioning.** `openapi`, `proto`, and the message-schema formats version with
+SemVer (`vN` lines bumped by `version_bump`). A `crd`'s version identity **is** its
+K8s API version (`v1alpha1` / `v1beta1` / `v1`): content changes republish in place
+(no numeric bump), and the stability suffix maps to lifecycle
+(`alpha`→experimental, `beta`→beta, none→stable) unless the module sets `lifecycle:`.
+
+> New catalog paths (e.g. `/crd`) must be provisioned in the catalog repo before a
+> format can publish there — an owner action, tracked separately from this workflow.
+
+Example — one repo publishing three formats:
+
+```yaml
+modules:
+  - id: openapi/csp.infoblox.com/iam-identity/v2   # format inferred: openapi
+    swagger: pkg/v2/pb/identity.swagger.json
+    fds: api-v2.binpb
+    audience: public
+  - id: crd/csp.platform.infoblox.com/cspaccountclaim/v1alpha1
+    crd: config/crd/bases/csp.platform.infoblox.com_cspaccountclaims.yaml
+  - id: jsonschema/csp.infoblox.com/audit-log/v1
+    jsonschema: repo/auditlog/schema/pb/AuditLog.jsonschema
+```
+
+A module with no `format:` and an `openapi/…` id behaves exactly as before — no
+regression.
+
+## Gating (per concern, format, module)
+
+Two gates run independently per module: the **breaking** gate and the
+**verify-clients** (SDK build) gate. Each resolves with this precedence — first
+match wins:
+
+1. the module's own field (`breaking:` / `verify_clients:` on the module),
+2. `formats.<fmt>.<concern>` (all modules of that format),
+3. `gates.<concern>` (repo-wide default),
+4. the workflow input (`breaking-gate` / `verify-clients`).
+
+Good global defaults mean most repos configure nothing:
+
+- **breaking** — `auto`: public modules block on a breaking change, internal is advisory.
+- **verify-clients** — client-generating formats (`openapi`/`crd`/`proto`) inherit
+  the workflow default (`fail`); non-client formats (`avro`/`jsonschema`/`parquet`)
+  default to `off` and never fail the run.
+
+Example — fail hard on the public REST client, warn on CRDs, leave schemas off:
+
+```yaml
+gates:
+  verify_clients: warn          # repo-wide default for every module
+formats:
+  openapi:
+    verify_clients: fail        # every openapi module must build its client
+modules:
+  - id: crd/csp.platform.infoblox.com/cspaccountclaim/v1alpha1
+    crd: config/crd/bases/....yaml
+    verify_clients: warn        # this one module only
+```
+
+`generators:` may likewise be set per module or per `formats.<fmt>`, falling back
+to the repo-wide `verify_clients.generators` (default `go`).
+
 ## Pipeline
+
+The pipeline below is the **`openapi`** emit followed by the common tail. Other
+formats skip the first two lines (`make <fds_target>` + `openapiv2to3`) and feed
+their source spec straight into `status → breaking → verify-clients → pathlint →
+release` — see [Formats](#formats).
 
 ```
 make <fds_target>                     # the repo's OWN pinned gentool: --descriptor_set_out --include_imports
@@ -84,11 +178,14 @@ Go field (see [`infobloxopen/apx`#42](https://github.com/infobloxopen/apx/pull/4
 For each converted spec the pipeline runs `apx client verify`, which generates a
 client and **compiles** it.
 
-The `verify-clients` workflow input controls the gate:
+The `verify-clients` workflow input is the **run-wide default**; it is resolved
+per module (module field > `formats.<fmt>` > `gates` > this input — see
+[Gating](#gating-per-concern-format-module)), and by default only
+client-generating formats (`openapi`/`crd`/`proto`) run it at all:
 
 | value | behavior |
 |-------|----------|
-| `fail` (default) | generate + compile every module's client; **fail the run** (check *and* publish, before any publish PR) if one does not build |
+| `fail` (default) | generate + compile the module's client; **fail the run** (check *and* publish, before any publish PR) if it does not build |
 | `warn` | run and report, never fail |
 | `off` | skip the gate |
 
@@ -96,8 +193,9 @@ The `verify-clients` workflow input controls the gate:
 > client blocks the run. Set `warn` to downgrade to advisory, or `off` to skip.
 > The catalog also enforces this at the boundary as a required check (CICD-1379).
 
-Generators default to `go`; override per repo with `verify_clients.generators`
-in `.apx-publish.yaml`. The gate needs the prebuilt `apx-toolchain` image to
+Generators default to `go`; override per repo with `verify_clients.generators`,
+or per format / module (see [Gating](#gating-per-concern-format-module)) in
+`.apx-publish.yaml`. The gate needs the prebuilt `apx-toolchain` image to
 provide `apx client verify` — a stale image without it will error, which (with
 the default `fail`) fails the run by design. Keep the toolchain image built from
 an apx that includes the command (>= v0.21.0).

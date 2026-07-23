@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Test stub for `make <fds_target>`. apx-publish.sh calls this only when an
+# fds-bearing module's FileDescriptorSet is missing. Records that it ran (a
+# .make-ran marker + the log) and creates the `fds:` files the config declares,
+# so the subsequent openapi emit step finds them — mirroring a real gentool run.
+echo "make $*" >> "${APX_TEST_LOG:?APX_TEST_LOG must be set}"
+: > .make-ran
+
+if command -v yq >/dev/null 2>&1 && [[ -f .apx-publish.yaml ]]; then
+  while IFS= read -r f; do
+    [[ -n "$f" && "$f" != "null" ]] || continue
+    mkdir -p "$(dirname "$f")"
+    : > "$f"
+  done < <(yq -r '.modules[] | select(.fds) | .fds' .apx-publish.yaml)
+fi

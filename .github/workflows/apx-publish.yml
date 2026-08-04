@@ -57,6 +57,16 @@ on:
         required: false
         type: boolean
         default: false
+      needs-vendor:
+        description: 'Run go mod vendor before make fds. Required when the repo vendors private Go modules that contain proto include files (e.g. atlas-gentool repos with -I=vendor). Requires the gitpat secret.'
+        required: false
+        type: boolean
+        default: false
+      go-private:
+        description: 'GOPRIVATE (and GONOSUMDB) pattern for private Go module fetching, e.g. "github.com/my-org/*". Only used when needs-vendor is true.'
+        required: false
+        type: string
+        default: ''
     secrets:
       # Least-privilege catalog "submit" GitHub App (forge: github). App needs
       # only contents:write + pull_requests:write + issues:write on the catalog
@@ -76,6 +86,9 @@ on:
         required: false
       gitea-token:
         required: false
+      gitpat:
+        description: 'GitHub PAT with read access to private Go modules. Required when needs-vendor is true. Pass as: secrets: gitpat: ${{ secrets.GITPAT }}'
+        required: false
 
 permissions:
   contents: read
@@ -88,6 +101,31 @@ jobs:
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
+
+      # Optional: set up Go and vendor private dependencies before make fds.
+      # Enabled by needs-vendor: true. Required for repos that pass -I=vendor to
+      # atlas-gentool (protobuf includes live inside vendored Go modules) and whose
+      # vendor directory is not committed. Uses ~/.netrc for auth so the credential
+      # is active only during go mod vendor and does not interfere with the
+      # App-token-based git operations that follow.
+      - name: Set up Go (for vendor)
+        if: inputs.needs-vendor
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ inputs.go-version-file }}
+
+      - name: Vendor Go dependencies
+        if: inputs.needs-vendor
+        run: |
+          set -euo pipefail
+          printf 'machine github.com login x-oauth-basic password %s\n' "${GITPAT}" > "$HOME/.netrc"
+          chmod 600 "$HOME/.netrc"
+          go mod vendor
+          rm -f "$HOME/.netrc"
+        env:
+          GOPRIVATE: ${{ inputs.go-private }}
+          GONOSUMDB: ${{ inputs.go-private }}
+          GITPAT: ${{ secrets.gitpat }}
 
       # Provision apx + its validator toolchain from the PREBUILT image instead of
       # installing/compiling it per run (npm install spectral, go install oasdiff/

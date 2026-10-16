@@ -249,6 +249,11 @@ SRC_BRANCH="${GITHUB_BASE_REF:-${GITHUB_REF_NAME:-$(git rev-parse --abbrev-ref H
 BASE_BRANCH=$(yq -r ".branch_targets.\"$SRC_BRANCH\" // \"\"" "$CONFIG")
 [[ -n "$BASE_BRANCH" && "$BASE_BRANCH" != "null" ]] || BASE_BRANCH=$(default_base "$SRC_BRANCH")
 PRERELEASE=0; [[ "$BASE_BRANCH" != "main" ]] && PRERELEASE=1
+# This resolution (from .apx-publish.yaml's branch_targets) is authoritative: every
+# `apx release prepare` below passes it as --base-branch. Left to itself, apx
+# re-resolves the base from the service repo's apx.yaml branch_targets — usually
+# unset there — so a `main: develop` mapping would compare and version against
+# develop here, yet record (and `release submit` target) the catalog's main.
 
 # Compare drift/breaking against — and, on publish, target — the resolved base
 # branch of the canonical clone. Best-effort: fall back to the default branch
@@ -629,7 +634,7 @@ if [[ "$MODE" == "check" ]]; then
       is_semver_line "$line" || { log "skip pre-release ratchet for $id (non-semver line $line)"; continue; }
       ver=$(channel_version "${PUBVERS[$i]}" "$line")
       if ! apx release prepare "$id" --version "$ver" --lifecycle beta \
-             --source-branch "$SRC_BRANCH" --encode-commit-hash \
+             --source-branch "$SRC_BRANCH" --base-branch "$BASE_BRANCH" --encode-commit-hash \
              --canonical-repo="$CANONICAL_REPO" --canonical-dir "$CANONICAL_DIR" \
              --dry-run >"/tmp/ratchet.$i" 2>&1; then
         note "> :x: Pre-release version gate failed for \`$id\` (base branch \`$BASE_BRANCH\`):"
@@ -658,7 +663,8 @@ publish_gitea() {
   local api="$GITEA_URL/api/v1/repos/$GITEA_ORG/$repo"
 
   local -a prep=(release prepare "$id" --version "$ver" --lifecycle "$lc"
-    --canonical-repo="github.com/${GITEA_ORG}/${repo}" --source-branch "$SRC_BRANCH")
+    --canonical-repo="github.com/${GITEA_ORG}/${repo}" --source-branch "$SRC_BRANCH"
+    --base-branch "$base")
   [[ "$PRERELEASE" == "1" ]] && prep+=(--encode-commit-hash --canonical-dir "$CANONICAL_DIR")
   apx "${prep[@]}" >/dev/null
   local tag gomod gomod_dir branch
@@ -722,13 +728,14 @@ publish_github() {
   local id="$1" ver="$2" lc="$3"
   : "${GITHUB_TOKEN:?GITHUB_TOKEN required for github publish}"
   local -a prep=(release prepare "$id" --version "$ver" --lifecycle "$lc"
-    --canonical-repo="$CANONICAL_REPO" --source-branch "$SRC_BRANCH")
+    --canonical-repo="$CANONICAL_REPO" --source-branch "$SRC_BRANCH"
+    --base-branch "$BASE_BRANCH")
   # ARCH-271 pre-release channel: encode the commit hash and run the ratchet
   # against the canonical clone at prepare time.
   [[ "$PRERELEASE" == "1" ]] && prep+=(--encode-commit-hash --canonical-dir "$CANONICAL_DIR")
   apx "${prep[@]}" >/dev/null
   ver=$(yq -r '.requested_version' .apx-release.yaml)   # may be hash-encoded
-  apx release submit   # native PR on GitHub → targets the manifest's base branch
+  apx release submit   # native PR on GitHub → targets the manifest's base branch (= $BASE_BRANCH)
   note "- \`$id\` → submitted publish PR ($ver, base \`$BASE_BRANCH\`)"
   # Drift issue via GitHub REST.
   jq -nc --arg t "catalog drift: ${id} needs publish (${ver})" \

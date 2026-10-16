@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Test stub for curl. Publish mode files a drift issue and lists open catalog PRs
+# (superseded-PR cleanup) over the GitHub REST API; record the call and answer
+# with an empty JSON list so no test touches the network.
+echo "curl $*" >> "${APX_TEST_LOG:?APX_TEST_LOG must be set}"
+echo '[]'

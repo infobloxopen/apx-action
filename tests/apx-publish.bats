@@ -3,11 +3,13 @@
 # Unit tests for scripts/apx-publish.sh — the publish-on-change engine.
 #
 # They exercise per-module format resolution, per-format emit dispatch, and the
-# per-concern/format/module gate resolution, with apx / openapiv2to3 / make
-# replaced by the recording stubs under tests/stubs. Every
-# test runs in `check` mode against an empty canonical clone (drift = absent), so
-# nothing is published — we assert on which tools ran, on the summary table, and
-# on where each spec was staged.
+# per-concern/format/module gate resolution, with apx / openapiv2to3 / make / curl
+# replaced by the recording stubs under tests/stubs. Tests run against an empty
+# canonical clone (drift = absent), mostly in `check` mode; the branch-routing
+# tests also drive `publish` (github forge), where the stubs stand in for
+# `apx release prepare/submit` and the GitHub REST calls, so nothing is published.
+# We assert on which tools ran (and with what args), on the summary table, and on
+# where each spec was staged.
 
 setup() {
   ROOT="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
@@ -18,7 +20,7 @@ setup() {
   BIN="$BATS_TEST_TMPDIR/bin"
   mkdir -p "$BIN"
   local s
-  for s in apx openapiv2to3 make; do
+  for s in apx openapiv2to3 make curl; do
     install -m 0755 "$ROOT/tests/stubs/$s" "$BIN/$s"
   done
   export PATH="$BIN:$PATH"
@@ -69,9 +71,9 @@ mkswagger2() {
 }
 
 staged()  { echo "$WORK/build/apx-modules/$1"; }          # staged spec path for an id/name
-log_has() { grep -Fq "$1" "$APX_TEST_LOG"; }
-log_count() { grep -Fc "$1" "$APX_TEST_LOG" || true; }
-summary_has() { grep -Fq "$1" "$SUMMARY"; }
+log_has() { grep -Fq -- "$1" "$APX_TEST_LOG"; }
+log_count() { grep -Fc -- "$1" "$APX_TEST_LOG" || true; }
+summary_has() { grep -Fq -- "$1" "$SUMMARY"; }
 
 assert_ok() {
   [ "$status" -eq 0 ] || { echo "expected exit 0, got $status"; echo "--- output ---"; echo "$output"; return 1; }
@@ -480,4 +482,68 @@ YAML
   run_check
   [ "$status" -ne 0 ]
   echo "$output" | grep -Fq "unknown format 'bogus'"
+}
+
+# --- branch routing: .apx-publish.yaml branch_targets drives apx --------------
+
+@test "publish (github): prepare targets the engine's branch_targets base, not apx's own default" {
+  # main → develop: the engine compares/versions against develop, so the release
+  # manifest (and thus `apx release submit`) must target develop too.
+  cat > .apx-publish.yaml <<'YAML'
+canonical_repo: github.com/example/apis
+branch_targets:
+  main: develop
+modules:
+  - id: jsonschema/csp.infoblox.com/audit-log/v1
+    jsonschema: schema/AuditLog.json
+YAML
+  mksrc schema/AuditLog.json
+
+  GITHUB_REF_NAME=main GITHUB_TOKEN=test-token \
+    run "$SCRIPT" --mode publish --config .apx-publish.yaml \
+      --canonical-dir "$CANON" --summary "$SUMMARY" --verify-clients off
+  assert_ok
+
+  log_has "apx release prepare jsonschema/csp.infoblox.com/audit-log/v1 --version v1.0.0-beta.1 --lifecycle beta"
+  log_has "--source-branch main --base-branch develop"
+  log_has "apx release submit"
+  summary_has "base \`develop\`"
+}
+
+@test "publish (github): default routing passes base main for a main push" {
+  cat > .apx-publish.yaml <<'YAML'
+canonical_repo: github.com/example/apis
+modules:
+  - id: jsonschema/csp.infoblox.com/audit-log/v1
+    jsonschema: schema/AuditLog.json
+YAML
+  mksrc schema/AuditLog.json
+
+  GITHUB_REF_NAME=main GITHUB_TOKEN=test-token \
+    run "$SCRIPT" --mode publish --config .apx-publish.yaml \
+      --canonical-dir "$CANON" --summary "$SUMMARY" --verify-clients off
+  assert_ok
+
+  log_has "apx release prepare jsonschema/csp.infoblox.com/audit-log/v1 --version v1.0.0 --lifecycle stable"
+  log_has "--source-branch main --base-branch main"
+  run grep -F -- "--encode-commit-hash" "$APX_TEST_LOG"
+  [ "$status" -ne 0 ]                                      # stable channel: no hash encoding
+}
+
+@test "check: the pre-release ratchet dry-run uses the engine's branch_targets base" {
+  cat > .apx-publish.yaml <<'YAML'
+canonical_repo: github.com/example/apis
+branch_targets:
+  main: develop
+modules:
+  - id: jsonschema/csp.infoblox.com/audit-log/v1
+    jsonschema: schema/AuditLog.json
+YAML
+  mksrc schema/AuditLog.json
+
+  GITHUB_BASE_REF=main run_check --verify-clients off
+  assert_ok
+
+  log_has "--source-branch main --base-branch develop --encode-commit-hash"
+  log_has "--dry-run"
 }

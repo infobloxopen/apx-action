@@ -13,7 +13,8 @@ configuration**.
 This workflow lives in **`infobloxopen/apx-action`** — the repo teams already
 consume to install apx. `apx` owns the schema *lifecycle* (convert is
 devedge-sdk; release/breaking/catalog are apx); this workflow only **orchestrates**
-(`FDS → convert → apx release`). It does not reimplement release logic.
+(`FDS → convert → apx release`, or a committed spec straight into `apx release`).
+It does not reimplement release logic.
 
 - Reusable workflow: `.github/workflows/apx-publish.yml` (`on: workflow_call`)
 - Engine (runs identically in CI and locally): `scripts/apx-publish.sh`
@@ -52,7 +53,8 @@ gentool pin flips the key, so on a cache hit the publish script skips `make <fds
 entirely — the atlas-gentool `docker run` (the slow step) runs only when an FDS input
 actually changed. Correct by construction (a proto change can never publish a stale FDS)
 and self-healing (nothing to re-commit). Over-breadth is safe: an unrelated match only
-forces a needless regen, never a stale hit.
+forces a needless regen, never a stale hit. A repo where no module sets `fds:` (native
+OpenAPI 3.x / crd / message-schema only) has no FDS, and the cache step is a no-op.
 
 > **Pin the gentool by digest.** The key hashes the pin *string*, so a floating or
 > re-pushable tag could let a re-pushed image serve a stale cached FDS. Pin the image
@@ -80,17 +82,21 @@ format's subtree (`/openapi`, `/crd`, …) by construction.
 
 | Format | Source field(s) | Emit step | Staged as | `verify-clients` default | Catalog path |
 |---|---|---|---|---|---|
-| `openapi` | `swagger` + `fds` | `make <fds_target>` → `openapiv2to3` | `<name>.yaml` | on (client) | `/openapi` |
+| `openapi` | `openapi` (native OpenAPI 3.x) | none — committed spec used directly | `<name>.yaml` | on (client) | `/openapi` |
+| `openapi` | `swagger` (gRPC-Gateway output) + `fds` (required) | `make <fds_target>` → `openapiv2to3` | `<name>.yaml` | on (client) | `/openapi` |
 | `crd` | `crd` | none — CRD YAML used directly | `<name>.yaml` | on (client) | `/crd` |
 | `proto` | `fds` | none — FDS used directly | `<name>.binpb` | on (client) | `/proto` |
 | `jsonschema` | `jsonschema` | none | `<name>.json` | off | `/jsonschema` |
 | `avro` | `avro` | none | `<name>.avsc` | off | `/avro` |
 | `parquet` | `parquet` | none | `<name>.parquet` | off | `/parquet` |
 
-Only `openapi` runs the OpenAPI toolchain (`make <fds_target>` → `openapiv2to3`);
-every other format uses its committed source verbatim. `make <fds_target>` runs
-once for the fds-bearing modules and is **skipped entirely** for a repo of only
-crd / message-schema modules.
+Only a gRPC-Gateway (`swagger:` + `fds:`) `openapi` module runs the OpenAPI
+toolchain (`make <fds_target>` → `openapiv2to3`); every other module — a native
+`openapi:` module included — uses its committed source verbatim (see
+[OpenAPI: native 3.x or gRPC-Gateway](#openapi-native-3x-or-grpc-gateway)).
+`make <fds_target>` runs once for the fds-bearing modules (gRPC-Gateway openapi,
+proto) and is **skipped entirely** for a repo of only native-openapi / crd /
+message-schema modules.
 
 **Versioning.** `openapi`, `proto`, and the message-schema formats version with
 SemVer (`vN` lines bumped by `version_bump`). A `crd`'s version identity **is** its
@@ -101,22 +107,70 @@ K8s API version (`v1alpha1` / `v1beta1` / `v1`): content changes republish in pl
 > New catalog paths (e.g. `/crd`) must be provisioned in the catalog repo before a
 > format can publish there — an owner action, tracked separately from this workflow.
 
-Example — one repo publishing three formats:
+Example — one repo publishing three formats, with both OpenAPI source shapes:
 
 ```yaml
 modules:
   - id: openapi/csp.infoblox.com/iam-identity/v2   # format inferred: openapi
-    swagger: pkg/v2/pb/identity.swagger.json
+    swagger: pkg/v2/pb/identity.swagger.json        # gRPC-Gateway output + its FDS → converted
     fds: api-v2.binpb
     audience: public
+  - id: openapi/csp.infoblox.com/iam-webhooks/v1   # format inferred: openapi
+    openapi: api/iam-webhooks-v1.openapi.yaml       # native OpenAPI 3.x → staged as-is, no fds
   - id: crd/csp.platform.infoblox.com/cspaccountclaim/v1alpha1
     crd: config/crd/bases/csp.platform.infoblox.com_cspaccountclaims.yaml
   - id: jsonschema/csp.infoblox.com/audit-log/v1
     jsonschema: repo/auditlog/schema/pb/AuditLog.jsonschema
 ```
 
-A module with no `format:` and an `openapi/…` id behaves exactly as before — no
-regression.
+A module with no `format:` and an `openapi/…` id is an `openapi` module; an
+existing `swagger:` + `fds:` module behaves exactly as before — no regression.
+
+### OpenAPI: native 3.x or gRPC-Gateway
+
+An `openapi` module sets **exactly one** source field, and that field — not
+`format:` — selects the emit. There is no separate format name.
+
+- **`openapi:` — native OpenAPI 3.x.** One committed, self-contained OpenAPI 3.x
+  document (YAML or JSON; 3.0 or 3.1 — see
+  [OpenAPI 3.1 and the SDK gate](#openapi-31-and-the-sdk-gate)), typically
+  hand-authored by a REST-only service with no proto. It is copied byte-for-byte to
+  `<name>.yaml`: no `make <fds_target>`, no FileDescriptorSet, no `openapiv2to3`.
+  The engine fails if the file does not parse, if its top-level `openapi:` key does
+  not start with `3.`, or if any `$ref` points outside the document (anything not
+  starting with `#`, e.g. `./schemas/pet.yaml` or an `https://` URL) — a module
+  stages a single file, so those refs would dangle in the catalog. Bundle a split
+  spec into one document first.
+- **`swagger:` + `fds:` — gRPC-Gateway output only.** The Swagger 2.0 that
+  gRPC-Gateway (`protoc-gen-openapiv2`) emits from the repo's protos, plus those
+  protos' FileDescriptorSet, which the converter requires: `make <fds_target>` →
+  `openapiv2to3 -descriptor <fds> <swagger>` → an OpenAPI v3 spec enriched from the
+  FDS. The Swagger may be JSON or YAML (`output_format=yaml`); YAML is handed to the
+  converter as JSON automatically. If the file is actually OpenAPI 3.x (top-level
+  `openapi: 3.*`), the engine fails fast and tells you to use `openapi:` instead.
+
+**Hand-authored Swagger 2.0 (no protos behind it) is not supported.** Convert it to
+OpenAPI 3.x first, then publish it with `openapi:`. A Swagger 2.0 document under
+`openapi:` is rejected with a message saying so.
+
+Config errors, caught up front before any `make`: `openapi:` and `swagger:` both
+set; neither set; `swagger:` without `fds:`; `openapi:` with `fds:` (an FDS only
+feeds the converter, which a native module never runs; it would just trigger a
+needless `make`). Both shapes run the same tail (drift, breaking, verify-clients,
+pathlint, release), land under `/openapi`, and can sit side by side in one repo.
+
+#### OpenAPI 3.1 and the SDK gate
+
+`verify-clients` defaults to `fail`, and its `go` generator (oapi-codegen v2.4.1)
+does not support OpenAPI 3.1 (upstream:
+[oapi-codegen/oapi-codegen#373](https://github.com/oapi-codegen/oapi-codegen/issues/373)).
+A 3.1 document that only uses 3.0-compatible constructs passes; 3.1-only constructs
+fail the gate — e.g. `type: [string, "null"]` fails with
+`unhandled Schema type: &[string null]`. `apx breaking` (oasdiff) handles 3.1 fine.
+If the gate trips on a 3.1-only construct: write the spec as 3.0.x
+(`nullable: true` instead of a `"null"` type), avoid 3.1-only constructs, or set
+`verify_clients: warn` (or `off`) on that module (see
+[Gating](#gating-per-concern-format-module)).
 
 ## Gating (per concern, format, module)
 
@@ -155,14 +209,16 @@ to the repo-wide `verify_clients.generators` (default `go`).
 
 ## Pipeline
 
-The pipeline below is the **`openapi`** emit followed by the common tail. Other
-formats skip the first two lines (`make <fds_target>` + `openapiv2to3`) and feed
-their source spec straight into `status → breaking → verify-clients → pathlint →
-release` — see [Formats](#formats).
+The pipeline below is the **gRPC-Gateway `openapi`** emit (`swagger:` + `fds:`)
+followed by the common tail. A native `openapi:` module and every other format
+skip the first two lines (`make <fds_target>` + `openapiv2to3`) and feed their
+committed source spec straight into `status → breaking → verify-clients →
+pathlint → release` — see [Formats](#formats). (A `proto` module needs
+`make <fds_target>` for its FDS, but never `openapiv2to3`.)
 
 ```
-make <fds_target>                     # the repo's OWN pinned gentool: --descriptor_set_out --include_imports
-openapiv2to3 -descriptor <fds> <swagger> <out>   # enriched OpenAPI v3 (v0.60.0; tolerant matching is the default)
+make <fds_target>                     # fds: modules only — the repo's OWN pinned gentool: --descriptor_set_out --include_imports
+openapiv2to3 -descriptor <fds> <swagger> <out>   # gRPC-Gateway swagger: modules only (YAML passed as JSON) — enriched OpenAPI v3 (v0.60.0; tolerant matching is the default)
 apx release status <id> --canonical-dir <clone>  # drift: unchanged | changed | absent (schema-scoped, ignores go.mod)
 apx breaking <new> --against <published>          # public = blocking, internal = advisory
 apx client verify --input <spec> --generator go   # SDK build gate: generate + compile the client (fail by default)
@@ -175,8 +231,8 @@ A spec can pass `lint`/`breaking` yet still generate a client that does not
 compile — e.g. a path parameter named `url` that shadows the `net/url` import,
 or redundant `limit`/`offset` params that collide with `_limit`/`_offset` on one
 Go field (see [`infobloxopen/apx`#42](https://github.com/infobloxopen/apx/pull/42)).
-For each converted spec the pipeline runs `apx client verify`, which generates a
-client and **compiles** it.
+For each staged spec — converted or native — the pipeline runs `apx client verify`,
+which generates a client and **compiles** it.
 
 The `verify-clients` workflow input is the **run-wide default**; it is resolved
 per module (module field > `formats.<fmt>` > `gates` > this input — see
@@ -230,8 +286,16 @@ delete-branch).
 
 ## Adopt in a service repo (three files)
 
-1. **`make fds`** — add one target that emits a FileDescriptorSet per surface via
-   the repo's existing gentool. One flag; no toolchain upgrade, no service rewrite:
+The steps below are the gRPC-Gateway path: the repo's protos produce the Swagger
+2.0 (`swagger:`) and the FileDescriptorSet (`fds:`), and the workflow converts them.
+A REST-only service with a hand-authored OpenAPI 3.x spec and no proto skips step 1
+entirely — see [REST-only service (no proto)](#rest-only-service-no-proto). A
+hand-authored Swagger 2.0 spec has no protos to supply an FDS, so it cannot use the
+gRPC-Gateway path: convert it to OpenAPI 3.x and take the REST-only path.
+
+1. **`make fds`** *(proto / gRPC-Gateway only)* — add one target that emits a
+   FileDescriptorSet per surface via the repo's existing gentool. One flag; no
+   toolchain upgrade, no service rewrite:
    ```make
    fds:
    	$(GENERATOR) $(FDS_INCLUDES) --include_imports \
@@ -243,13 +307,13 @@ delete-branch).
    script), list the file(s) that carry it under `fds_key_files:` (below) so the cache
    key sees a gentool bump.
 2. **`apx.yaml`** — standard apx project config. `module_roots` must include where
-   the workflow stages converted specs (`build/apx-modules`).
+   the workflow stages specs (`build/apx-modules`).
 3. **`.apx-publish.yaml`** — the entire per-repo adoption surface:
    ```yaml
    canonical_repo: github.com/Infoblox-CTO/apis   # or a sandbox
    forge: github                                   # github | gitea
-   fds_target: fds
-   converter_version: v0.60.0
+   fds_target: fds                                 # make target for fds: modules (default `fds`)
+   converter_version: v0.60.0                      # openapiv2to3 pin, used by swagger: modules
    version_bump: minor
    # supersede:                    # optional (CICD-1378) — auto-close prior beta PRs
    #   label: superseded           # label for closed superseded PRs (default `superseded`)
@@ -263,7 +327,7 @@ delete-branch).
    #   - 'build/gentool.version'   # gentool pin lives outside a Makefile*.
    modules:
      - id: openapi/csp.infoblox.com/identity/v2    # R10 module ID
-       swagger: pkg/v2/pb/identity.swagger.json    # committed gateway swagger
+       swagger: pkg/v2/pb/identity.swagger.json    # committed gRPC-Gateway swagger (JSON or YAML)
        fds: api-v2.binpb                           # FDS from `make fds`
        lifecycle: stable
        audience: public                            # public blocks on breaking; internal is advisory
@@ -300,6 +364,38 @@ jobs:
       apx-app-private-key: ${{ secrets.APX_SUBMIT_APP_PRIVATE_KEY }}
 ```
 
+### REST-only service (no proto)
+
+A service whose API is a hand-authored OpenAPI 3.x document (no proto, no
+gRPC-Gateway) needs only steps 2 and 3 — **no Makefile change**. `apx.yaml` and
+the caller workflows are the same as above; in `.apx-publish.yaml`, point the
+module's `openapi:` at the committed spec. If the spec is hand-authored Swagger
+2.0, convert it to OpenAPI 3.x first; `swagger:` accepts only gRPC-Gateway output
+with its protos' FDS.
+
+```yaml
+canonical_repo: github.com/Infoblox-CTO/apis
+forge: github
+version_bump: minor
+modules:
+  - id: openapi/csp.infoblox.com/example-service/v1
+    openapi: openapi/example-service-v1.openapi.yaml   # hand-authored OpenAPI 3.x (YAML or JSON)
+    lifecycle: experimental
+    audience: internal
+```
+
+Leave out `fds_target`, `converter_version`, and `fds_key_files`. Do not add a
+placeholder `fds:` or a no-op `fds` make target: `openapi:` with `fds:` is a config
+error. With no `fds:` module the workflow skips `make <fds_target>`, the FDS cache,
+and `openapiv2to3`. The spec is staged byte-for-byte, so drift, breaking (oasdiff),
+pathlint, and release run against exactly the file you commit. It must be one
+self-contained document: a split spec with `$ref`s to other files or URLs is
+rejected, so bundle it first. The SDK build gate still applies (`verify-clients`
+defaults to `fail`): the spec must generate a client that compiles. For a 3.1 spec,
+3.1-only constructs (e.g. `type: [string, "null"]`) fail that gate — write 3.0.x,
+avoid them, or set `verify_clients: warn` on the module (see
+[OpenAPI 3.1 and the SDK gate](#openapi-31-and-the-sdk-gate)).
+
 ### Credentials (least privilege, no per-repo secrets)
 
 The workflow mints a **short-lived installation token** from a dedicated
@@ -333,10 +429,11 @@ no network and works with any forge.
 
 ## Notes & caveats
 
-- **Baseline:** the workflow's deterministic conversion is the source of truth. The
+- **Baseline:** the workflow's deterministic emit (the conversion, or the committed
+  file for a verbatim source such as `openapi:`) is the source of truth. The
   first `publish` run establishes the published baseline; subsequent runs read
   `unchanged` until the API actually changes. A hand-edited catalog spec will read
-  as `changed`/`breaking` against a fresh convert — let the workflow own the spec.
+  as `changed`/`breaking` against a fresh emit — let the workflow own the spec.
 - **Version:** `version_bump` (default `minor`) bumps the latest published version;
   a first publish uses `v<line>.0.0`.
 - **Branch routing (ARCH-271):** the source branch resolves through
@@ -360,6 +457,19 @@ no network and works with any forge.
   repo's Makefile when onboarding; do not infer it from the gentool tag.
 - **Converter:** v0.60.0 made tolerant `(verb,path)`-from-FDS matching the default
   (`-strict` opts back into fail-loud; `-compat` is a deprecated no-op).
+- **`swagger:` file is already OpenAPI 3.x:** the engine fails up front with
+  `swagger source for <id> is already OpenAPI <v>, not gRPC-Gateway Swagger 2.0`;
+  older refs got as far as the converter and died with
+  `openapiv2to3: parse v2 …: invalid character '#' looking for beginning of value`.
+  The spec needs no conversion — move the path to `openapi:` and drop `fds:` (see
+  [REST-only service (no proto)](#rest-only-service-no-proto)).
+- **`openapi source for <id> is Swagger 2.0, not OpenAPI 3.x`:** `swagger:` takes
+  only gRPC-Gateway output with its protos' FDS. Convert a hand-authored Swagger 2.0
+  spec to OpenAPI 3.x and keep it under `openapi:`.
+- **`openapi source for <id> references another file ($ref: …)`:** a module stages
+  one file; bundle the split spec into a single document (only `#/…` refs).
+- **`unhandled Schema type: &[string null]`** from the SDK build gate: a 3.1-only
+  construct — see [OpenAPI 3.1 and the SDK gate](#openapi-31-and-the-sdk-gate).
 
 ## Piloted end to end
 

@@ -50,6 +50,26 @@ run_check() {
 # touch a file, creating parent dirs
 mksrc() { mkdir -p "$(dirname "$1")"; : > "$1"; }
 
+# write a minimal OpenAPI 3.x document as YAML, led by a comment the way a
+# hand-authored spec is (a JSON-only reader dies on that '#'); $2 = version
+mkoas3() {
+  mkdir -p "$(dirname "$1")"
+  cat > "$1" <<YAML
+# hand-authored OpenAPI spec — no proto / gRPC-Gateway behind it
+openapi: ${2:-3.1.0}
+info:
+  title: example
+  version: 1.0.0
+paths: {}
+YAML
+}
+
+# write a minimal Swagger 2.0 document as JSON, the shape gRPC-Gateway emits
+mkswagger2() {
+  mkdir -p "$(dirname "$1")"
+  printf '{"swagger":"2.0","info":{"title":"example","version":"1.0.0"},"paths":{}}\n' > "$1"
+}
+
 staged()  { echo "$WORK/build/apx-modules/$1"; }          # staged spec path for an id/name
 log_has() { grep -Fq -- "$1" "$APX_TEST_LOG"; }
 log_count() { grep -Fc -- "$1" "$APX_TEST_LOG" || true; }
@@ -101,6 +121,243 @@ YAML
   log_has "make fds"
   log_has "openapiv2to3 -descriptor"
   [ -f "$(staged openapi/csp.infoblox.com/identity/v2/identity.yaml)" ]
+}
+
+@test "openapi native: OpenAPI 3.x source staged verbatim — no make, no FDS, no convert" {
+  cat > .apx-publish.yaml <<'YAML'
+canonical_repo: github.com/example/apis
+modules:
+  - id: openapi/csp.infoblox.com/example-service/v1
+    openapi: openapi/example-service-v1.openapi.yaml
+    lifecycle: experimental
+    audience: internal
+YAML
+  mkoas3 openapi/example-service-v1.openapi.yaml 3.1.0
+
+  run_check --verify-clients warn
+  assert_ok
+
+  [ ! -f .make-ran ]                                       # no FDS to compile
+  [ "$(log_count 'openapiv2to3')" -eq 0 ]                  # no conversion
+  spec="$(staged openapi/csp.infoblox.com/example-service/v1/example-service.yaml)"
+  cmp openapi/example-service-v1.openapi.yaml "$spec"      # byte-for-byte, comments kept
+  log_has "client verify --input build/apx-modules/openapi/csp.infoblox.com/example-service/v1/example-service.yaml"
+  summary_has "| openapi |"
+}
+
+@test "openapi native: a JSON OpenAPI 3.0 source is accepted and staged verbatim" {
+  cat > .apx-publish.yaml <<'YAML'
+canonical_repo: github.com/example/apis
+modules:
+  - id: openapi/csp.infoblox.com/example-service/v1
+    openapi: api/example-service.json
+YAML
+  mkdir -p api
+  printf '{"openapi":"3.0.3","info":{"title":"example","version":"1.0.0"},"paths":{}}\n' > api/example-service.json
+
+  run_check --verify-clients warn
+  assert_ok
+
+  [ "$(log_count 'openapiv2to3')" -eq 0 ]
+  cmp api/example-service.json "$(staged openapi/csp.infoblox.com/example-service/v1/example-service.yaml)"
+}
+
+@test "openapi native-only repo never installs the converter" {
+  # Converter absent from PATH — the stub and any real install (e.g. ~/go/bin) —
+  # so the engine's "install it if missing" branch is live …
+  rm "$BIN/openapiv2to3"
+  local d p=""
+  while IFS= read -r d; do [[ -x "$d/openapiv2to3" ]] || p+="${p:+:}$d"; done < <(tr ':' '\n' <<<"$PATH")
+  export PATH="$p"
+  run command -v openapiv2to3
+  [ "$status" -ne 0 ]
+  # … and record any `go install` it attempts.
+  printf '#!/usr/bin/env bash\necho "go $*" >> "$APX_TEST_LOG"\n' > "$BIN/go"
+  chmod +x "$BIN/go"
+  cat > .apx-publish.yaml <<'YAML'
+canonical_repo: github.com/example/apis
+modules:
+  - id: openapi/csp.infoblox.com/example-service/v1
+    openapi: openapi/example-service-v1.openapi.yaml
+YAML
+  mkoas3 openapi/example-service-v1.openapi.yaml
+
+  run_check --verify-clients warn
+  assert_ok
+
+  [ "$(log_count 'go install')" -eq 0 ]
+  [[ "$output" != *"installing openapiv2to3"* ]]
+}
+
+@test "openapi native: a Swagger 2.0 document under 'openapi:' is rejected" {
+  cat > .apx-publish.yaml <<'YAML'
+canonical_repo: github.com/example/apis
+modules:
+  - id: openapi/csp.infoblox.com/identity/v2
+    openapi: pkg/v2/identity.swagger.json
+YAML
+  mkswagger2 pkg/v2/identity.swagger.json
+
+  run_check
+  [ "$status" -ne 0 ]
+  echo "$output" | grep -Fq "is Swagger 2.0, not OpenAPI 3.x"
+  echo "$output" | grep -Fq "convert a hand-authored Swagger 2.0 to OpenAPI 3.x first"
+  [ "$(log_count 'openapiv2to3')" -eq 0 ]
+}
+
+@test "openapi native: a spec that \$refs another file is rejected (one self-contained document)" {
+  cat > .apx-publish.yaml <<'YAML'
+canonical_repo: github.com/example/apis
+modules:
+  - id: openapi/csp.infoblox.com/example-service/v1
+    openapi: openapi/example-service-v1.openapi.yaml
+YAML
+  mkoas3 openapi/example-service-v1.openapi.yaml
+  cat >> openapi/example-service-v1.openapi.yaml <<'YAML'
+components:
+  schemas:
+    Local: {type: object}
+    Thing:
+      type: object
+      properties:
+        $ref: {type: string}                 # a property NAMED $ref is not a reference
+        local: {$ref: '#/components/schemas/Local'}
+        error: {$ref: '../schemas/error.yaml'}
+YAML
+
+  run_check
+  [ "$status" -ne 0 ]
+  echo "$output" | grep -Fq "references another file (\$ref: ../schemas/error.yaml)"
+  [ ! -f "$(staged openapi/csp.infoblox.com/example-service/v1/example-service.yaml)" ]  # nothing staged
+}
+
+@test "openapi native: an unparseable source reports the parse error" {
+  cat > .apx-publish.yaml <<'YAML'
+canonical_repo: github.com/example/apis
+modules:
+  - id: openapi/csp.infoblox.com/example-service/v1
+    openapi: openapi/example-service-v1.openapi.yaml
+YAML
+  mkdir -p openapi
+  printf 'openapi: 3.1.0\ninfo: {title: [\n' > openapi/example-service-v1.openapi.yaml
+
+  run_check
+  [ "$status" -ne 0 ]
+  echo "$output" | grep -Fq "does not parse"
+  [[ "$output" != *"not an OpenAPI 3.x document"* ]]
+}
+
+@test "openapi gRPC-Gateway: a YAML swagger (output_format=yaml) is handed to the converter as JSON" {
+  cat > .apx-publish.yaml <<'YAML'
+canonical_repo: github.com/example/apis
+modules:
+  - id: openapi/csp.infoblox.com/identity/v2
+    swagger: pkg/v2/identity.swagger.yaml
+    fds: api-v2.binpb
+YAML
+  mkdir -p pkg/v2
+  printf '# generated by protoc-gen-openapiv2\nswagger: "2.0"\ninfo: {title: identity, version: "1.0"}\npaths: {}\n' \
+    > pkg/v2/identity.swagger.yaml
+  mksrc api-v2.binpb
+
+  run_check --verify-clients warn
+  assert_ok                                                # the stub, like the real tool, rejects non-JSON
+
+  log_has "openapiv2to3 -descriptor api-v2.binpb "
+  [ "$(log_count 'pkg/v2/identity.swagger.yaml')" -eq 0 ]  # YAML path never reaches the converter
+  log_has "/in/identity.swagger.json "
+  [ -f "$(staged openapi/csp.infoblox.com/identity/v2/identity.yaml)" ]
+}
+
+@test "openapi gRPC-Gateway: a make-generated swagger that turns out to be OpenAPI 3.x fails before convert" {
+  # The swagger is produced by `make <fds_target>`, so the up-front check can't see
+  # it; the emit-time check must catch it before the converter runs.
+  cat > "$BIN/make" <<'SH'
+#!/usr/bin/env bash
+echo "make $*" >> "$APX_TEST_LOG"
+: > api-v2.binpb
+mkdir -p gen
+printf 'openapi: 3.0.3\ninfo: {title: t, version: "1"}\npaths: {}\n' > gen/identity.swagger.yaml
+SH
+  chmod +x "$BIN/make"
+  cat > .apx-publish.yaml <<'YAML'
+canonical_repo: github.com/example/apis
+modules:
+  - id: openapi/csp.infoblox.com/identity/v2
+    swagger: gen/identity.swagger.yaml
+    fds: api-v2.binpb
+YAML
+
+  run_check
+  [ "$status" -eq 1 ]
+  [ "$(log_count 'make fds')" -eq 1 ]
+  [ "$(log_count 'openapiv2to3')" -eq 0 ]
+  echo "$output" | grep -Fq "already OpenAPI 3.0.3, not gRPC-Gateway Swagger 2.0"
+}
+
+@test "openapi: a 'swagger:' source that is already OpenAPI 3.x fails before make, naming the fix" {
+  # The infobloxopen/apx-action#16 config: a hand-authored 3.1 YAML under
+  # `swagger:` plus a placeholder FDS. Previously this ran make, then crashed the
+  # converter with "invalid character '#' looking for beginning of value".
+  cat > .apx-publish.yaml <<'YAML'
+canonical_repo: github.com/example/apis
+modules:
+  - id: openapi/csp.infoblox.com/example-service/v1
+    swagger: openapi/example-service-v1.openapi.yaml
+    fds: example-service-v1.binpb
+YAML
+  mkoas3 openapi/example-service-v1.openapi.yaml 3.1.0
+
+  run_check
+  [ "$status" -ne 0 ]
+  [ ! -f .make-ran ]                                       # failed fast, before the gentool
+  [ "$(log_count 'openapiv2to3')" -eq 0 ]
+  echo "$output" | grep -Fq "already OpenAPI 3.1.0, not gRPC-Gateway Swagger 2.0"
+  echo "$output" | grep -Fq "declare it as 'openapi: openapi/example-service-v1.openapi.yaml'"
+}
+
+@test "openapi: conflicting or missing source fields are rejected before make" {
+  local cfg
+  for cfg in \
+    "openapi: spec.yaml|swagger: spec.yaml|sets both 'openapi:' and 'swagger:'" \
+    "openapi: spec.yaml|fds: api.binpb|'fds:' applies only to a 'swagger:'" \
+    "lifecycle: beta|audience: internal|needs a source" \
+    "swagger: gen/thing.swagger.json|lifecycle: beta|is gRPC-Gateway output and needs 'fds:'"; do
+    IFS='|' read -r f1 f2 want <<<"$cfg"
+    printf 'canonical_repo: github.com/example/apis\nmodules:\n  - id: openapi/csp.infoblox.com/thing/v1\n    %s\n    %s\n' \
+      "$f1" "$f2" > .apx-publish.yaml
+    mkoas3 spec.yaml
+
+    run_check
+    [ "$status" -eq 2 ] || { echo "[$want] expected exit 2, got $status: $output"; return 1; }
+    echo "$output" | grep -Fq "$want" || { echo "[$want] not in: $output"; return 1; }
+    [ ! -f .make-ran ]
+  done
+}
+
+@test "openapi: native and Swagger-sourced modules side by side — make + convert only for the Swagger one" {
+  cat > .apx-publish.yaml <<'YAML'
+canonical_repo: github.com/example/apis
+modules:
+  - id: openapi/csp.infoblox.com/identity/v2
+    swagger: pkg/v2/identity.swagger.json
+    fds: api-v2.binpb
+  - id: openapi/csp.infoblox.com/example-service/v1
+    openapi: openapi/example-service-v1.openapi.yaml
+YAML
+  mkswagger2 pkg/v2/identity.swagger.json
+  mkoas3 openapi/example-service-v1.openapi.yaml 3.0.3
+  # FDS absent → make runs once, for the Swagger module only
+
+  run_check --verify-clients warn
+  assert_ok
+
+  [ "$(log_count 'make fds')" -eq 1 ]
+  [ "$(log_count 'openapiv2to3 -descriptor')" -eq 1 ]      # only the Swagger module converts
+  log_has "openapiv2to3 -descriptor api-v2.binpb pkg/v2/identity.swagger.json"
+  [ -f "$(staged openapi/csp.infoblox.com/identity/v2/identity.yaml)" ]
+  cmp openapi/example-service-v1.openapi.yaml \
+    "$(staged openapi/csp.infoblox.com/example-service/v1/example-service.yaml)"
 }
 
 @test "explicit format: overrides the id root segment" {

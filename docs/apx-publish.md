@@ -351,7 +351,11 @@ no network and works with any forge.
   which routes to no channel. Keying the check on the base branch makes a PR into
   `develop` run the pre-release channel and its ratchet (a real pre-merge gate),
   and a PR into `main`/`master` run the stable channel — matching the publish that
-  the merge will trigger.
+  the merge will trigger. The `branch_targets` in `.apx-publish.yaml` is the one
+  that counts: the workflow passes the resolved base branch to
+  `apx release prepare --base-branch`, so the release manifest and the publish PR
+  target the same branch the drift and ratchet checks ran against. There is no need
+  to repeat the mapping in `apx.yaml`.
 - **Gateway era:** read the actual `--swagger_out` vs `--openapiv2_out` flag from the
   repo's Makefile when onboarding; do not infer it from the gentool tag.
 - **Converter:** v0.60.0 made tolerant `(verb,path)`-from-FDS matching the default

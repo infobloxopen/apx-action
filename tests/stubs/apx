@@ -2,7 +2,9 @@
 # Test stub for the apx CLI. Records every invocation to $APX_TEST_LOG and returns
 # canned output so tests can drive scripts/apx-publish.sh without a real apx.
 #   release status → JSON drift result (absent = first publish, nothing to compare)
-#   breaking / client verify → succeed (exit 0)
+#   release prepare → (unless --dry-run) writes the .apx-release.yaml manifest
+#     publish mode reads back, with requested_version = --version
+#   breaking / client verify / release submit → succeed (exit 0)
 # The drift status can be overridden per run with $STUB_DRIFT_STATUS.
 echo "apx $*" >> "${APX_TEST_LOG:?APX_TEST_LOG must be set}"
 
@@ -12,6 +14,14 @@ case "${1:-}" in
       status)
         printf '{"status":"%s","published_version":"%s"}\n' \
           "${STUB_DRIFT_STATUS:-absent}" "${STUB_PUBLISHED_VERSION:-}" ;;
+      prepare)
+        ver="" dry=0 prev=""
+        for a in "$@"; do
+          [[ "$prev" == "--version" ]] && ver="$a"
+          [[ "$a" == "--dry-run" ]] && dry=1
+          prev="$a"
+        done
+        [[ "$dry" == 1 ]] || printf 'requested_version: %s\n' "$ver" > .apx-release.yaml ;;
       *) : ;;
     esac ;;
   breaking) : ;;   # no breaking change

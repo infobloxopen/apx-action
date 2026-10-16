@@ -2,8 +2,11 @@
 # Test stub for the openapiv2to3 converter. Invoked as:
 #   openapiv2to3 -descriptor <fds> <swagger> <out-dir>
 # Records the call and writes exactly one <name>.openapi.yaml into <out-dir>, which
-# is what the real converter emits and what apx-publish.sh moves into place.
+# is what the real converter emits and what apx-publish.sh moves into place. Like
+# the real converter it decodes <swagger> as JSON, so a non-JSON input fails.
 echo "openapiv2to3 $*" >> "${APX_TEST_LOG:?APX_TEST_LOG must be set}"
+
+jq empty "$3" 2>/dev/null || { echo "openapiv2to3: parse v2 $3: not JSON" >&2; exit 1; }
 
 out="$4"
 mkdir -p "$out"

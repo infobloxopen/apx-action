@@ -152,7 +152,7 @@ format_ext() {
 }
 
 # format_source_field <fmt> — the .apx-publish.yaml module field naming the format's
-# source file (openapi's native field; its Swagger 2.0 shape is `swagger` + `fds`).
+# source file (openapi's native field; its gRPC-Gateway shape is `swagger` + `fds`).
 format_source_field() {
   case "$1" in
     openapi)    echo openapi ;;
@@ -167,8 +167,8 @@ format_source_field() {
 
 # oas3_version <file> — the document's top-level `openapi:` value when it is an
 # OpenAPI 3.x document, else empty (Swagger 2.0 declares `swagger: "2.0"` instead).
-# Reads YAML or JSON. Never fails: an unparseable file yields empty and is left to
-# the step that consumes it to report.
+# Reads YAML or JSON. Never fails: an unparseable file yields empty (the native emit
+# reports the parse error itself; the converter reports it for a `swagger:` source).
 oas3_version() {
   local v
   v=$(yq -r '.openapi // ""' "$1" 2>/dev/null) || v=""
@@ -176,14 +176,23 @@ oas3_version() {
   return 0
 }
 
+# external_ref <file> — the first `$ref` that points outside the document (any ref
+# not starting with `#`), else empty. A module stages ONE file, so a split spec's
+# relative refs would dangle in the catalog.
+external_ref() {
+  yq -r '[.. | select(tag == "!!map" and has("$ref")) | .["$ref"]
+          | select(tag == "!!str" and (test("^#") | not))] | .[0] // ""' "$1"
+}
+
 # reject_oas3_swagger <id> <file> — fail, naming the fix, when a `swagger:` source
-# is already OpenAPI 3.x. openapiv2to3 only reads Swagger 2.0 JSON and would die on
-# it with an opaque parse error (`invalid character '#' …` for a commented YAML).
+# is already OpenAPI 3.x. openapiv2to3 only reads gRPC-Gateway Swagger 2.0: a 3.x
+# YAML dies with an opaque parse error (`invalid character '#' …`), and a 3.x JSON
+# "converts" while silently dropping its components.
 reject_oas3_swagger() {
   local v
   v=$(oas3_version "$2")
   [[ -z "$v" ]] && return 0
-  echo "swagger source for $1 is already OpenAPI $v, not Swagger 2.0: $2 — declare it as 'openapi: $2' (and drop 'fds:') to publish it without conversion" >&2
+  echo "swagger source for $1 is already OpenAPI $v, not gRPC-Gateway Swagger 2.0: $2 — declare it as 'openapi: $2' (and drop 'fds:') to publish it without conversion" >&2
   return 1
 }
 
@@ -261,7 +270,7 @@ note "Source branch: \`$SRC_BRANCH\` → base branch: \`$BASE_BRANCH\`$([[ "$PRE
 note ""
 
 # ── Client-build gate mode ────────────────────────────────────────────────────
-# fail (default): generate an SDK from each converted spec and compile it; a spec
+# fail (default): generate an SDK from each staged spec and compile it; a spec
 #   whose client does not build FAILS the run (in check AND publish) before any
 #   publish PR is opened. warn: report only. off: skip. This makes an apx that
 #   ships `apx client verify` a hard prerequisite of the toolchain image.
@@ -286,8 +295,12 @@ log "supersede=$SUPERSEDE label=$SUPERSEDE_LABEL"
 # An openapi module is sourced one of two ways (exactly one):
 #   openapi: <file>          a committed OpenAPI 3.x document (hand-authored, e.g. a
 #                            REST-only service) → staged verbatim; no FDS, no converter
-#   swagger: <file> + fds:   a Swagger 2.0 document (gRPC-Gateway) and its
-#                            FileDescriptorSet → converted by openapiv2to3
+#   swagger: <file> + fds:   the Swagger 2.0 that gRPC-Gateway (protoc-gen-openapiv2)
+#                            emits from the repo's protos (JSON or YAML), plus those
+#                            protos' FileDescriptorSet → converted + enriched by
+#                            openapiv2to3. Not a general Swagger 2.0 path: a
+#                            hand-authored Swagger 2.0 has no FDS behind it, so it
+#                            must be converted to OpenAPI 3.x and use `openapi:`.
 # Resolved up front so a misconfigured module fails before any make/convert —
 # including a `swagger:` that is already OpenAPI 3.x, which would otherwise run the
 # repo's (slow) `make <fds_target>` only to crash the converter.
@@ -300,17 +313,18 @@ for ((i=0; i<NMODULES; i++)); do
   swagger=$(yq -r ".modules[$i].swagger // \"\"" "$CONFIG")
   fds=$(yq -r ".modules[$i].fds // \"\"" "$CONFIG")
   if [[ -n "$native" && -n "$swagger" ]]; then
-    echo "openapi module $id sets both 'openapi:' and 'swagger:' — use 'openapi:' for an OpenAPI 3.x document, or 'swagger:' + 'fds:' for Swagger 2.0" >&2
+    echo "openapi module $id sets both 'openapi:' and 'swagger:' — use 'openapi:' for an OpenAPI 3.x document, or 'swagger:' + 'fds:' for gRPC-Gateway Swagger and its protos' FileDescriptorSet" >&2
     exit 2
   elif [[ -n "$native" ]]; then
-    [[ -z "$fds" ]] || { echo "openapi module $id: 'fds:' applies only to a 'swagger:' (Swagger 2.0) source — a native 'openapi:' module needs no FileDescriptorSet; remove 'fds:'" >&2; exit 2; }
+    [[ -z "$fds" ]] || { echo "openapi module $id: 'fds:' applies only to a 'swagger:' (gRPC-Gateway) source — a native 'openapi:' module needs no FileDescriptorSet; remove 'fds:'" >&2; exit 2; }
     OAS_SOURCE[i]=native
   elif [[ -n "$swagger" ]]; then
     if [[ -f "$swagger" ]]; then reject_oas3_swagger "$id" "$swagger" || exit 1; fi
+    [[ -n "$fds" ]] || { echo "openapi module $id: a 'swagger:' source is gRPC-Gateway output and needs 'fds:' (its protos' FileDescriptorSet, which the converter requires) — a spec with no protos behind it must be OpenAPI 3.x under 'openapi:'" >&2; exit 2; }
     OAS_SOURCE[i]=swagger
     needs_converter=1
   else
-    echo "openapi module $id needs a source: 'openapi:' (an OpenAPI 3.x document) or 'swagger:' + 'fds:' (Swagger 2.0, converted)" >&2
+    echo "openapi module $id needs a source: 'openapi:' (an OpenAPI 3.x document) or 'swagger:' + 'fds:' (gRPC-Gateway Swagger + its protos' FileDescriptorSet, converted)" >&2
     exit 2
   fi
 done
@@ -447,8 +461,18 @@ for ((i=0; i<NMODULES; i++)); do
       if [[ "${OAS_SOURCE[i]}" == native ]]; then
         src=$(yq -r ".modules[$i].openapi" "$CONFIG")
         [[ -f "$src" ]] || { echo "openapi source not found for $ID: $src" >&2; exit 1; }
+        perr=$(yq '.' "$src" 2>&1 >/dev/null) || { echo "openapi source for $ID does not parse: $src: $perr" >&2; exit 1; }
         oasv=$(oas3_version "$src")
-        [[ -n "$oasv" ]] || { echo "openapi source for $ID is not an OpenAPI 3.x document (no top-level 'openapi: 3.x'): $src — a Swagger 2.0 document goes under 'swagger:' with 'fds:'" >&2; exit 1; }
+        if [[ -z "$oasv" ]]; then
+          if [[ "$(yq -r '.swagger // ""' "$src")" == 2.* ]]; then
+            echo "openapi source for $ID is Swagger 2.0, not OpenAPI 3.x: $src — 'swagger:' + 'fds:' accepts only gRPC-Gateway output with its protos' FileDescriptorSet; convert a hand-authored Swagger 2.0 to OpenAPI 3.x first" >&2
+          else
+            echo "openapi source for $ID is not an OpenAPI 3.x document (no top-level 'openapi: 3.x'): $src" >&2
+          fi
+          exit 1
+        fi
+        ref=$(external_ref "$src")
+        [[ -z "$ref" ]] || { echo "openapi source for $ID references another file (\$ref: $ref): $src — a module stages one self-contained document, so bundle the spec first (only '#/…' refs)" >&2; exit 1; }
         log "stage OpenAPI $oasv $src -> $SPEC (native, no conversion)"
         cp "$src" "$SPEC"
       else
@@ -459,7 +483,16 @@ for ((i=0; i<NMODULES; i++)); do
         [[ -f "$FDS" ]]     || { echo "FDS not found for $ID: $FDS (did '$FDS_TARGET' run?)" >&2; exit 1; }
         log "convert $SWAGGER -> $SPEC (fds=$FDS)"
         tmpout=$(mktemp -d)
-        openapiv2to3 -descriptor "$FDS" "$SWAGGER" "$tmpout"
+        # The converter decodes its input as JSON, so gRPC-Gateway Swagger emitted
+        # as YAML (protoc-gen-openapiv2 output_format=yaml) is handed to it as JSON.
+        swagger_in="$SWAGGER"
+        if ! jq empty "$SWAGGER" 2>/dev/null; then
+          mkdir -p "$tmpout/in"
+          swagger_in="$tmpout/in/$(basename "${SWAGGER%.*}").json"
+          log "swagger $SWAGGER is YAML — passing it to the converter as JSON"
+          yq -p=yaml -o=json '.' "$SWAGGER" > "$swagger_in"
+        fi
+        openapiv2to3 -descriptor "$FDS" "$swagger_in" "$tmpout"
         # converter writes <name>.openapi.yaml (+ a .coverage.json sidecar); publish
         # the single spec under the catalog name. Fail loudly on 0 or >1 matches
         # rather than silently mv-ing the wrong/first file.

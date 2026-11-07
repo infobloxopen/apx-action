@@ -372,11 +372,6 @@ fi
 # module name = the <name> segment of format/domain/name/line
 module_name() { echo "$1" | awk -F/ '{print $(NF-1)}'; }
 
-# is_semver_line <line> — true for a plain major line like v1/v2 (openapi + message
-# formats version with SemVer). K8s crd lines (v1alpha1/v1beta1) are NOT SemVer and
-# version by their K8s API-version identity instead (see module_version).
-is_semver_line() { [[ "$1" =~ ^v[0-9]+$ ]]; }
-
 # next_version <published-version-or-empty> <line>
 # Computes the next STABLE version by bumping the published version per
 # VERSION_BUMP. Any pre-release/build suffix on the published version is stripped
@@ -419,14 +414,50 @@ crd_lifecycle() {
   esac
 }
 
+# crd_maturity <line> — the stability segment of a K8s CRD version: "alpha" for
+# v1alpha1, "beta" for v2beta3, and "" for a GA version (v1).
+crd_maturity() {
+  if [[ "$1" =~ ^v[0-9]+(alpha|beta)[0-9]+$ ]]; then echo "${BASH_REMATCH[1]}"; fi
+}
+
+# crd_prerelease_version <published-version-or-empty> <line>
+# The release version of a crd alpha/beta line. apx keeps the K8s version as the
+# module LINE and versions releases with SemVer whose major matches it (apx
+# docs/concepts/crd-format.md): v1alpha1 releases v1.0.0-alpha.N, v1beta1 releases
+# v1.0.0-beta.N. Each publish bumps N past the line's last published release; on
+# the pre-release channel apx then appends .g<commit-hash> (--encode-commit-hash).
+crd_prerelease_version() {
+  local pub="$1" line="$2" mat major base n=0
+  mat=$(crd_maturity "$line")
+  major="${line#v}"; major="${major%%[a-z]*}"
+  base="${major}.0.0"
+  if [[ "$pub" =~ ^v?([0-9]+\.[0-9]+\.[0-9]+)-${mat}\.([0-9]+) ]]; then
+    base="${BASH_REMATCH[1]}"; n="${BASH_REMATCH[2]}"
+  fi
+  echo "v${base}-${mat}.$((10#$n + 1))"
+}
+
 # module_version <fmt> <published-version-or-empty> <line>
-# The version to publish for a module. SemVer formats bump per
-# VERSION_BUMP via channel_version. A crd's version identity IS its K8s API version
-# (the line, e.g. v1alpha1): content changes republish in place — no numeric bump.
+# The version to publish for a module. A crd alpha/beta line versions as
+# v<major>.0.0-<alpha|beta>.N (crd_prerelease_version). Every other module,
+# including a GA crd line (v1), bumps SemVer per VERSION_BUMP via channel_version.
 module_version() {
   local fmt="$1" pub="$2" line="$3"
-  if [[ "$fmt" == "crd" ]] || ! is_semver_line "$line"; then echo "$line"; return; fi
+  if [[ "$fmt" == "crd" && -n "$(crd_maturity "$line")" ]]; then
+    crd_prerelease_version "$pub" "$line"; return
+  fi
   channel_version "$pub" "$line"
+}
+
+# module_lifecycle <fmt> <line> <resolved-lifecycle>
+# The lifecycle to publish under. A crd alpha/beta line keeps its resolved
+# lifecycle (experimental/beta from the K8s version, or an explicit `lifecycle:`)
+# on every channel, so an alpha CRD is never relabeled beta. Every other module
+# follows the channel (channel_lifecycle).
+module_lifecycle() {
+  local fmt="$1" line="$2" lc="$3"
+  if [[ "$fmt" == "crd" && -n "$(crd_maturity "$line")" ]]; then echo "$lc"; return; fi
+  channel_lifecycle "$lc"
 }
 
 # Staged specs, and per-module status, collected for the summary + publish.
@@ -624,16 +655,16 @@ if [[ "$MODE" == "check" ]]; then
   # AC-1 (fail-closed ratchet) on the pre-release channel: for each changed/absent
   # module, dry-run prepare against the canonical clone so a PR targeting develop
   # fails when its beta would land at/below the line's highest GA. prepare also
-  # validates the commit-hash-encoded version is legal SemVer.
+  # validates the commit-hash-encoded version is legal SemVer. Every module runs
+  # it, crd included, with the exact version + lifecycle publish will use: prepare
+  # is where apx enforces SemVer, the version↔line major and version↔lifecycle.
   if [[ "$PRERELEASE" == "1" ]]; then
     for ((i=0; i<NMODULES; i++)); do
       [[ "${STATUSES[$i]}" == "unchanged" ]] && continue
       id="${IDS[$i]}"; line=$(echo "$id" | awk -F/ '{print $NF}')
-      # The beta ratchet is SemVer-ordered; K8s crd versions (v1alpha1…) don't
-      # participate — skip non-SemVer lines.
-      is_semver_line "$line" || { log "skip pre-release ratchet for $id (non-semver line $line)"; continue; }
-      ver=$(channel_version "${PUBVERS[$i]}" "$line")
-      if ! apx release prepare "$id" --version "$ver" --lifecycle beta \
+      ver=$(module_version "${FORMATS[$i]}" "${PUBVERS[$i]}" "$line")
+      lc=$(module_lifecycle "${FORMATS[$i]}" "$line" "${LIFECYCLES[$i]}")
+      if ! apx release prepare "$id" --version "$ver" --lifecycle "$lc" \
              --source-branch "$SRC_BRANCH" --base-branch "$BASE_BRANCH" --encode-commit-hash \
              --canonical-repo="$CANONICAL_REPO" --canonical-dir "$CANONICAL_DIR" \
              --dry-run >"/tmp/ratchet.$i" 2>&1; then
@@ -761,7 +792,7 @@ for ((i=0; i<NMODULES; i++)); do
   published_any=1
   ID="${IDS[$i]}"; FMT="${FORMATS[$i]}"; LINE=$(echo "$ID" | awk -F/ '{print $NF}')
   VER=$(module_version "$FMT" "${PUBVERS[$i]}" "$LINE")
-  LC=$(channel_lifecycle "${LIFECYCLES[$i]}")
+  LC=$(module_lifecycle "$FMT" "$LINE" "${LIFECYCLES[$i]}")
   log "publish $ID [$FMT] ($ST) -> $VER [$LC, base $BASE_BRANCH]"
   if [[ "$FORGE" == "gitea" ]]; then
     publish_gitea "$ID" "$VER" "$LC" "${NAMES[$i]}" "${SPECFILES[$i]}" "${EXTS[$i]}"

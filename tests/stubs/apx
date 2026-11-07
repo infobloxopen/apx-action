@@ -2,8 +2,9 @@
 # Test stub for the apx CLI. Records every invocation to $APX_TEST_LOG and returns
 # canned output so tests can drive scripts/apx-publish.sh without a real apx.
 #   release status → JSON drift result (absent = first publish, nothing to compare)
-#   release prepare → (unless --dry-run) writes the .apx-release.yaml manifest
-#     publish mode reads back, with requested_version = --version
+#   release prepare → validates --version / --lifecycle the way apx does, then
+#     (unless --dry-run) writes the .apx-release.yaml manifest publish mode reads
+#     back, with requested_version = --version
 #   breaking / client verify / release submit → succeed (exit 0)
 # The drift status can be overridden per run with $STUB_DRIFT_STATUS.
 echo "apx $*" >> "${APX_TEST_LOG:?APX_TEST_LOG must be set}"
@@ -15,12 +16,34 @@ case "${1:-}" in
         printf '{"status":"%s","published_version":"%s"}\n' \
           "${STUB_DRIFT_STATUS:-absent}" "${STUB_PUBLISHED_VERSION:-}" ;;
       prepare)
-        ver="" dry=0 prev=""
+        ver="" lc="" dry=0 enc=0 prev=""
         for a in "$@"; do
           [[ "$prev" == "--version" ]] && ver="$a"
+          [[ "$prev" == "--lifecycle" ]] && lc="$a"
           [[ "$a" == "--dry-run" ]] && dry=1
+          [[ "$a" == "--encode-commit-hash" ]] && enc=1
           prev="$a"
         done
+        # Mirror apx prepare's version checks (apx internal/config: ParseSemVer,
+        # EncodeCommitHash, ValidateVersionLifecycle) so a test fails the way real
+        # apx does, e.g. on a K8s version like v1alpha1 passed as --version.
+        semver='^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+        if [[ ! "$ver" =~ $semver ]]; then
+          echo "[INVALID_VERSION] invalid version \"$ver\": invalid semver \"$ver\"" >&2; exit 1
+        fi
+        pre=""; [[ "$ver" == *-* ]] && pre="${ver#*-}"; pre="${pre%%+*}"
+        if [[ "$enc" == 1 && -z "$pre" ]]; then
+          echo "[INVALID_VERSION] cannot encode a commit hash on stable version \"$ver\"" >&2; exit 1
+        fi
+        case "$lc" in
+          experimental) ok=0; [[ "$pre" == alpha* ]] && ok=1 ;;
+          beta)         ok=0; [[ "$pre" =~ ^(alpha|beta|rc) ]] && ok=1 ;;
+          stable)       ok=0; [[ -z "$pre" ]] && ok=1 ;;
+          *)            ok=1 ;;
+        esac
+        if [[ "$ok" != 1 ]]; then
+          echo "[LIFECYCLE_MISMATCH] lifecycle \"$lc\" does not allow version \"$ver\"" >&2; exit 1
+        fi
         [[ "$dry" == 1 ]] || printf 'requested_version: %s\n' "$ver" > .apx-release.yaml ;;
       *) : ;;
     esac ;;

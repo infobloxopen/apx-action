@@ -547,3 +547,98 @@ YAML
   log_has "--source-branch main --base-branch develop --encode-commit-hash"
   log_has "--dry-run"
 }
+
+# --- crd release versions (CICD-2678) ----------------------------------------
+# A CRD's K8s version is the module LINE; releases are SemVer whose major matches
+# it (v1alpha1 → v1.0.0-alpha.N). The apx stub rejects a non-SemVer --version and
+# a version that does not fit --lifecycle, as real apx prepare does.
+
+# mkcrd <line> [extra module yaml] — one crd module on the given K8s version line,
+# routed main → develop (the pre-release channel) unless $CRD_TARGET overrides it.
+mkcrd() {
+  cat > .apx-publish.yaml <<YAML
+canonical_repo: github.com/example/apis
+branch_targets:
+  main: ${CRD_TARGET:-develop}
+modules:
+  - id: crd/csp.platform.infoblox.com/cspaccountclaim/$1
+    crd: config/crd/bases/cspaccountclaim.yaml
+${2:-}
+YAML
+  mksrc config/crd/bases/cspaccountclaim.yaml
+}
+
+run_publish() {
+  GITHUB_REF_NAME=main GITHUB_TOKEN=test-token \
+    run "$SCRIPT" --mode publish --config .apx-publish.yaml \
+      --canonical-dir "$CANON" --summary "$SUMMARY" --verify-clients off "$@"
+}
+
+@test "publish (github): a v1alpha1 crd releases v1.0.0-alpha.1 as experimental, hash-encoded on develop" {
+  mkcrd v1alpha1
+  run_publish
+  assert_ok
+
+  log_has "apx release prepare crd/csp.platform.infoblox.com/cspaccountclaim/v1alpha1 --version v1.0.0-alpha.1 --lifecycle experimental"
+  log_has "--source-branch main --base-branch develop --encode-commit-hash"
+  log_has "apx release submit"
+  run grep -F -- "--version v1alpha1" "$APX_TEST_LOG"
+  [ "$status" -ne 0 ]                                      # never the K8s version itself
+}
+
+@test "publish (github): a changed v1alpha1 crd bumps alpha.N past the last published release" {
+  mkcrd v1alpha1
+  STUB_DRIFT_STATUS=drift STUB_PUBLISHED_VERSION=v1.0.0-alpha.3.g0123456789ab run_publish
+  assert_ok
+
+  log_has "cspaccountclaim/v1alpha1 --version v1.0.0-alpha.4 --lifecycle experimental"
+}
+
+@test "publish (github): a v1beta1 crd on the stable channel releases v1.0.0-beta.1 as beta, no hash" {
+  CRD_TARGET=main mkcrd v1beta1
+  run_publish
+  assert_ok
+
+  log_has "cspaccountclaim/v1beta1 --version v1.0.0-beta.1 --lifecycle beta"
+  run grep -F -- "--encode-commit-hash" "$APX_TEST_LOG"
+  [ "$status" -ne 0 ]
+}
+
+@test "publish (github): a v2alpha1 crd releases on the v2 major" {
+  CRD_TARGET=main mkcrd v2alpha1
+  run_publish
+  assert_ok
+
+  log_has "cspaccountclaim/v2alpha1 --version v2.0.0-alpha.1 --lifecycle experimental"
+}
+
+@test "publish (github): a GA v1 crd follows the SemVer channel rules" {
+  CRD_TARGET=main mkcrd v1
+  run_publish
+  assert_ok
+  log_has "cspaccountclaim/v1 --version v1.0.0 --lifecycle stable"
+
+  : > "$APX_TEST_LOG"
+  mkcrd v1                                                 # main → develop
+  run_publish
+  assert_ok
+  log_has "cspaccountclaim/v1 --version v1.0.0-beta.1 --lifecycle beta"
+}
+
+@test "publish (github): an explicit lifecycle on a crd alpha line is kept on develop" {
+  mkcrd v1alpha1 "    lifecycle: deprecated"
+  run_publish
+  assert_ok
+
+  log_has "cspaccountclaim/v1alpha1 --version v1.0.0-alpha.1 --lifecycle deprecated"
+}
+
+@test "check: crd modules run the pre-release dry-run prepare with their release version" {
+  mkcrd v1alpha1
+  GITHUB_BASE_REF=main run_check --verify-clients off
+  assert_ok
+
+  log_has "cspaccountclaim/v1alpha1 --version v1.0.0-alpha.1 --lifecycle experimental"
+  log_has "--encode-commit-hash"
+  log_has "--dry-run"
+}

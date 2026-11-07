@@ -99,10 +99,26 @@ proto) and is **skipped entirely** for a repo of only native-openapi / crd /
 message-schema modules.
 
 **Versioning.** `openapi`, `proto`, and the message-schema formats version with
-SemVer (`vN` lines bumped by `version_bump`). A `crd`'s version identity **is** its
-K8s API version (`v1alpha1` / `v1beta1` / `v1`): content changes republish in place
-(no numeric bump), and the stability suffix maps to lifecycle
-(`alpha`→experimental, `beta`→beta, none→stable) unless the module sets `lifecycle:`.
+SemVer (`vN` lines bumped by `version_bump`). A `crd` module's K8s API version
+(`v1alpha1` / `v1beta1` / `v1`) is its **line**, the last segment of the module
+ID. One module exists per served CRD version, and each line has its own SemVer
+releases. The release major matches the line, and the stability suffix sets both
+the pre-release tag and the lifecycle, as described in apx's
+[CRD format](https://github.com/infobloxopen/apx/blob/main/docs/concepts/crd-format.md):
+
+| CRD version (line) | Lifecycle | Release version | Tag |
+|---|---|---|---|
+| `v1alpha1` | experimental | `v1.0.0-alpha.N` | `crd/<group>/<kind>/v1alpha1/v1.0.0-alpha.N` |
+| `v1beta1` | beta | `v1.0.0-beta.N` | `crd/<group>/<kind>/v1beta1/v1.0.0-beta.N` |
+| `v1` (GA) | stable | `v1.0.0`, then bumped by `version_bump` | `crd/<group>/<kind>/v1/v1.0.0` |
+
+Each content change to an alpha or beta line publishes the next `N`. On the
+pre-release channel, apx appends the commit hash (for example
+`v1.0.0-alpha.1.g0123456789ab`). An alpha or beta CRD keeps its lifecycle on every
+channel; the pre-release channel doesn't relabel it `beta`. A module's explicit
+`lifecycle:` overrides the derived one. A GA `v1` line follows the same channel
+rules as the other SemVer formats. To graduate a CRD, add its new served version
+(`v1beta1`, `v1`) as a new module entry. Don't promote the alpha module.
 
 > New catalog paths (e.g. `/crd`) must be provisioned in the catalog repo before a
 > format can publish there — an owner action, tracked separately from this workflow.
